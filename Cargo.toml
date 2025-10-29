@@ -133,3 +133,7 @@ required-features = ["events"]
 [[example]]
 name = "key-display"
 required-features = ["events"]
+
+[[example]]
+name = "query-colors"
+required-features = ["events"]

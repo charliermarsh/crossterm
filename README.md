@@ -139,6 +139,22 @@ fn main() -> std::io::Result<()> {
 
 Checkout this [list](https://docs.rs/crossterm/latest/crossterm/index.html#supported-commands) with all possible commands.
 
+When the `events` feature is enabled on Unix-like systems you can query the terminal's default
+palette:
+
+```rust
+use crossterm::style::{query_background_color, query_foreground_color};
+
+fn main() -> std::io::Result<()> {
+    println!("Foreground: {:?}", query_foreground_color()?);
+    println!("Background: {:?}", query_background_color()?);
+    Ok(())
+}
+```
+
+Each function returns `io::Result<Option<Color>>`, where `None` indicates that the terminal
+responded but the payload could not be parsed.
+
 ### Feature Flags
 
 ```toml

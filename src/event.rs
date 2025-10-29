@@ -1183,6 +1183,19 @@ pub(crate) enum InternalEvent {
     /// Attributes and architectural class of the terminal.
     #[cfg(unix)]
     PrimaryDeviceAttributes,
+    /// OSC color response (`slot`, `payload`).
+    #[cfg(unix)]
+    OscColor { slot: u8, payload: OscColorPayload },
+}
+
+/// Parsed payload of an OSC color response.
+#[cfg(unix)]
+#[derive(Debug, PartialOrd, PartialEq, Hash, Clone, Eq)]
+pub(crate) enum OscColorPayload {
+    /// Parsed RGB values (always 8-bit per channel).
+    Rgb { r: u8, g: u8, b: u8 },
+    /// Payload was returned but not recognized/parsible.
+    Unrecognized(String),
 }
 
 #[cfg(test)]
