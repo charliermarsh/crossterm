@@ -98,6 +98,12 @@ use crate::{csi, impl_display};
 
 pub(crate) mod sys;
 
+#[cfg(all(unix, feature = "events"))]
+mod startup;
+
+#[cfg(all(unix, feature = "events"))]
+pub use startup::{query_terminal_startup, KeyboardEnhancementProbe, TerminalStartupProbe};
+
 #[cfg(feature = "events")]
 pub use sys::supports_keyboard_enhancement;
 

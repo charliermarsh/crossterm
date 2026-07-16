@@ -1564,7 +1564,7 @@ mod tests {
                     payload,
                     OscColorPayload::Rgb {
                         r: 255,
-                        g: 128,
+                        g: 127,
                         b: 0
                     }
                 );

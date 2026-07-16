@@ -132,8 +132,12 @@ mod tests {
 
     #[cfg(unix)]
     use super::super::filter::CursorPositionFilter;
+    #[cfg(all(unix, feature = "bracketed-paste"))]
+    use super::super::filter::TerminalStartupProbeFilter;
+    #[cfg(all(unix, feature = "bracketed-paste"))]
+    use super::super::{KeyCode, KeyEvent, OscColorPayload};
     use super::{
-        super::{filter::InternalEventFilter, Event},
+        super::{filter::EventFilter as InternalEventFilter, Event},
         EventSource, InternalEvent, InternalEventReader,
     };
 
@@ -222,6 +226,64 @@ mod tests {
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), SKIPPED_EVENT);
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "bracketed-paste"))]
+    fn test_startup_probe_preserves_interleaved_input_events() {
+        let input = [
+            InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('h')))),
+            InternalEvent::CursorPosition(9, 19),
+            InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Backspace))),
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
+            },
+            InternalEvent::Event(Event::Paste("hello\nworld".to_string())),
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb { r: 4, g: 5, b: 6 },
+            },
+            InternalEvent::PrimaryDeviceAttributes,
+        ];
+        let source = FakeSource::with_events(&input);
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(source)),
+            skipped_events: Vec::with_capacity(32),
+        };
+        let filter = TerminalStartupProbeFilter {
+            query_keyboard: true,
+        };
+
+        for expected in [
+            InternalEvent::CursorPosition(9, 19),
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
+            },
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb { r: 4, g: 5, b: 6 },
+            },
+            InternalEvent::PrimaryDeviceAttributes,
+        ] {
+            assert!(reader.poll(Some(Duration::from_secs(1)), &filter).unwrap());
+            assert_eq!(reader.read(&filter).unwrap(), expected);
+        }
+
+        assert_eq!(
+            reader.read(&InternalEventFilter).unwrap(),
+            InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('h'))))
+        );
+        assert_eq!(
+            reader.read(&InternalEventFilter).unwrap(),
+            InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Backspace)))
+        );
+        assert_eq!(
+            reader.read(&InternalEventFilter).unwrap(),
+            InternalEvent::Event(Event::Paste("hello\nworld".to_string()))
+        );
     }
 
     #[test]

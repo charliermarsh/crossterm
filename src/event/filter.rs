@@ -62,6 +62,26 @@ impl Filter for OscColorFilter {
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalStartupProbeFilter {
+    pub(crate) query_keyboard: bool,
+}
+
+#[cfg(unix)]
+impl Filter for TerminalStartupProbeFilter {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        matches!(
+            *event,
+            InternalEvent::CursorPosition(_, _) | InternalEvent::OscColor { .. }
+        ) || self.query_keyboard
+            && matches!(
+                *event,
+                InternalEvent::KeyboardEnhancementFlags(_) | InternalEvent::PrimaryDeviceAttributes
+            )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EventFilter;
 
@@ -82,7 +102,7 @@ impl Filter for EventFilter {
 mod tests {
     use super::{
         CursorPositionFilter, EventFilter, Filter, KeyboardEnhancementFlagsFilter, OscColorFilter,
-        PrimaryDeviceAttributesFilter,
+        PrimaryDeviceAttributesFilter, TerminalStartupProbeFilter,
     };
     use crate::event::Event;
     use crate::event::{InternalEvent, OscColorPayload};
@@ -129,6 +149,29 @@ mod tests {
             payload: payload.clone()
         }));
         assert!(!filter.eval(&OscColor { slot: 11, payload }));
+    }
+
+    #[test]
+    fn test_terminal_startup_probe_filter_matches_requested_responses() {
+        let payload = OscColorPayload::Rgb { r: 1, g: 2, b: 3 };
+        let filter = TerminalStartupProbeFilter {
+            query_keyboard: true,
+        };
+        assert!(filter.eval(&InternalEvent::CursorPosition(1, 2)));
+        assert!(filter.eval(&OscColor { slot: 10, payload }));
+        assert!(filter.eval(&InternalEvent::KeyboardEnhancementFlags(
+            crate::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )));
+        assert!(filter.eval(&InternalEvent::PrimaryDeviceAttributes));
+        assert!(!filter.eval(&InternalEvent::Event(Event::Resize(10, 10))));
+
+        let filter = TerminalStartupProbeFilter {
+            query_keyboard: false,
+        };
+        assert!(!filter.eval(&InternalEvent::KeyboardEnhancementFlags(
+            crate::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )));
+        assert!(!filter.eval(&InternalEvent::PrimaryDeviceAttributes));
     }
 
     #[test]

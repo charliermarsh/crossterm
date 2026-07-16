@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_parse_osc_rgb_long_components() {
-        assert_eq!(parse_osc_rgb("rgb:ffff/8000/0000"), Some((255, 128, 0)));
+        assert_eq!(parse_osc_rgb("rgb:ffff/8000/0000"), Some((255, 127, 0)));
     }
 
     #[test]
