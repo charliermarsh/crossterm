@@ -1,13 +1,15 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
 use crate::event::{
-    filter::TerminalStartupProbeFilter, poll_internal, read_internal, InternalEvent,
-    OscColorPayload,
+    filter::TerminalStartupProbeFilter, read::InternalEventReader,
+    try_lock_internal_event_reader_for, InternalEvent, OscColorPayload,
 };
 use crate::style::Color;
-use crate::terminal::{disable_raw_mode, enable_raw_mode};
+use crate::terminal::disable_raw_mode;
+use crate::terminal::sys::file_descriptor::{FileDesc, NonblockingGuard};
 
 struct RawModeGuard {
     active: bool,
@@ -15,13 +17,16 @@ struct RawModeGuard {
 
 impl RawModeGuard {
     fn enable() -> io::Result<Self> {
-        enable_raw_mode()?;
-        Ok(Self { active: true })
+        Ok(Self {
+            active: crate::terminal::sys::enable_raw_mode_if_needed()?,
+        })
     }
 
     fn restore(mut self) -> io::Result<()> {
-        disable_raw_mode()?;
-        self.active = false;
+        if self.active {
+            disable_raw_mode()?;
+            self.active = false;
+        }
         Ok(())
     }
 }
@@ -68,10 +73,8 @@ struct ProbeState {
 impl ProbeState {
     fn record(&mut self, event: InternalEvent) {
         match event {
-            InternalEvent::CursorPosition(x, y) => {
-                if self.cursor_position.is_none() {
-                    self.cursor_position = Some((x, y));
-                }
+            InternalEvent::CursorPosition(x, y) | InternalEvent::ExtendedCursorPosition(x, y) => {
+                self.cursor_position = Some((x, y));
             }
             InternalEvent::OscColor { slot: 10, payload } => {
                 if self.foreground_color.is_none() {
@@ -89,7 +92,9 @@ impl ProbeState {
             InternalEvent::PrimaryDeviceAttributes => {
                 self.saw_primary_device_attributes = true;
             }
-            InternalEvent::Event(_) | InternalEvent::OscColor { .. } => {}
+            InternalEvent::Event(_)
+            | InternalEvent::CursorPositionOrF3(_, _, _)
+            | InternalEvent::OscColor { .. } => {}
         }
     }
 
@@ -98,7 +103,7 @@ impl ProbeState {
             && self.foreground_color.is_some()
             && self.background_color.is_some()
             && (keyboard_probe == KeyboardEnhancementProbe::Skip
-                || self.saw_keyboard_enhancement_flags && self.saw_primary_device_attributes)
+                || self.saw_primary_device_attributes)
     }
 
     fn into_probe(self) -> TerminalStartupProbe {
@@ -121,48 +126,62 @@ fn color_from_payload(payload: OscColorPayload) -> Option<Color> {
     }
 }
 
-/// Query the cursor position, default colors, and optional keyboard support under one deadline.
+/// Query the cursor position, default colors, and optional keyboard support under one terminal-I/O
+/// deadline.
 ///
 /// The query uses crossterm's internal event reader, so key presses, bracketed pastes, and other
 /// non-query events remain queued for the next [`crate::event::read`] or event stream poll.
-/// When keyboard support is queried, both the enhancement-flags and fallback responses are
-/// drained when available; an out-of-order fallback therefore uses the full timeout before it is
-/// treated as unsupported.
+/// The timeout bounds reader-lock acquisition, query I/O retries, and response polling under a
+/// single deadline. First-use event-source initialization and terminal mode setup or restoration
+/// use synchronous platform APIs and are not interruptible by this timeout.
+/// Callers must flush any buffered stdout output before probing; the query writes directly to the
+/// terminal descriptor so a contended stdout mutex cannot extend the deadline.
+/// When keyboard support is queried, primary device attributes complete the unsupported fallback
+/// immediately. If enhancement flags arrive first, the fallback is drained before returning.
 pub fn query_terminal_startup(
     timeout: Duration,
     keyboard_probe: KeyboardEnhancementProbe,
 ) -> io::Result<TerminalStartupProbe> {
-    if crate::terminal::sys::is_raw_mode_enabled() {
-        query_terminal_startup_raw(timeout, keyboard_probe)
-    } else {
-        let raw_mode_guard = RawModeGuard::enable()?;
-        let result = query_terminal_startup_raw(timeout, keyboard_probe);
-        raw_mode_guard.restore()?;
-        result
+    let started_at = Instant::now();
+    let Some(mut reader) = try_lock_internal_event_reader_for(timeout) else {
+        return Ok(ProbeState::default().into_probe());
+    };
+    if remaining_timeout(started_at, timeout).is_zero() {
+        return Ok(ProbeState::default().into_probe());
     }
+
+    let raw_mode_guard = RawModeGuard::enable()?;
+    let result = query_terminal_startup_raw(timeout, keyboard_probe, started_at, &mut reader);
+    raw_mode_guard.restore()?;
+    result
 }
 
 fn query_terminal_startup_raw(
     timeout: Duration,
     keyboard_probe: KeyboardEnhancementProbe,
+    started_at: Instant,
+    reader: &mut InternalEventReader,
 ) -> io::Result<TerminalStartupProbe> {
-    let query: &[u8] = match keyboard_probe {
-        KeyboardEnhancementProbe::Query => b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?u\x1B[c",
-        KeyboardEnhancementProbe::Skip => b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\",
-    };
-    send_query(query)?;
+    if remaining_timeout(started_at, timeout).is_zero() {
+        return Ok(ProbeState::default().into_probe());
+    }
 
-    let started_at = Instant::now();
+    let query: &[u8] = match keyboard_probe {
+        KeyboardEnhancementProbe::Query => b"\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?u\x1B[c\x1B[?6n",
+        KeyboardEnhancementProbe::Skip => b"\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?6n",
+    };
+    send_query(query, started_at, timeout)?;
+
     let filter = TerminalStartupProbeFilter {
         query_keyboard: keyboard_probe == KeyboardEnhancementProbe::Query,
     };
     let mut state = ProbeState::default();
     loop {
         let remaining = remaining_timeout(started_at, timeout);
-        if remaining.is_zero() || !poll_internal(Some(remaining), &filter)? {
+        if remaining.is_zero() || !reader.poll(Some(remaining), &filter)? {
             return Ok(state.into_probe());
         }
-        state.record(read_internal(&filter)?);
+        state.record(reader.read(&filter)?);
         if state.is_complete(keyboard_probe) {
             return Ok(state.into_probe());
         }
@@ -173,7 +192,11 @@ fn remaining_timeout(started_at: Instant, timeout: Duration) -> Duration {
     timeout.saturating_sub(started_at.elapsed())
 }
 
-fn send_query(query: &[u8]) -> io::Result<()> {
+fn send_query(query: &[u8], started_at: Instant, timeout: Duration) -> io::Result<()> {
+    if remaining_timeout(started_at, timeout).is_zero() {
+        return Err(query_write_timeout());
+    }
+
     #[cfg(feature = "libc")]
     // Safety: `isatty` only inspects the supplied file descriptor.
     let stdin_is_terminal = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
@@ -181,17 +204,86 @@ fn send_query(query: &[u8]) -> io::Result<()> {
     let stdin_is_terminal = rustix::termios::isatty(rustix::stdio::stdin());
 
     if stdin_is_terminal {
-        let mut stdout = io::stdout();
-        write_query(query, &mut stdout)
-    } else {
-        let mut tty = OpenOptions::new().write(true).open("/dev/tty")?;
-        write_query(query, &mut tty)
+        #[cfg(feature = "libc")]
+        let stdout_fd = FileDesc::new(libc::STDOUT_FILENO, false);
+        #[cfg(not(feature = "libc"))]
+        let stdout_fd = FileDesc::Borrowed(rustix::stdio::stdout());
+        let _nonblocking = NonblockingGuard::new(&stdout_fd)?;
+        let mut stdout = &stdout_fd;
+        return write_query(query, &mut stdout, started_at, timeout);
+    }
+
+    #[cfg(feature = "libc")]
+    let nonblocking = libc::O_NONBLOCK;
+    #[cfg(not(feature = "libc"))]
+    let nonblocking = rustix::fs::OFlags::NONBLOCK.bits() as i32;
+
+    let mut tty = OpenOptions::new()
+        .write(true)
+        .custom_flags(nonblocking)
+        .open("/dev/tty")?;
+    write_query(query, &mut tty, started_at, timeout)
+}
+
+fn write_query(
+    mut query: &[u8],
+    writer: &mut impl Write,
+    started_at: Instant,
+    timeout: Duration,
+) -> io::Result<()> {
+    while !query.is_empty() {
+        if remaining_timeout(started_at, timeout).is_zero() {
+            return Err(query_write_timeout());
+        }
+        match writer.write(query) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write the terminal startup query",
+                ));
+            }
+            Ok(written) => query = &query[written..],
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::Interrupted =>
+            {
+                wait_for_query_write(started_at, timeout)?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    loop {
+        if remaining_timeout(started_at, timeout).is_zero() {
+            return Err(query_write_timeout());
+        }
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::Interrupted =>
+            {
+                wait_for_query_write(started_at, timeout)?;
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 
-fn write_query(query: &[u8], writer: &mut impl Write) -> io::Result<()> {
-    writer.write_all(query)?;
-    writer.flush()
+fn wait_for_query_write(started_at: Instant, timeout: Duration) -> io::Result<()> {
+    let remaining = remaining_timeout(started_at, timeout);
+    if remaining.is_zero() {
+        return Err(query_write_timeout());
+    }
+    std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    Ok(())
+}
+
+fn query_write_timeout() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "timed out while writing the terminal startup query",
+    )
 }
 
 #[cfg(test)]
@@ -200,9 +292,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        remaining_timeout, write_query, KeyboardEnhancementProbe, ProbeState, TerminalStartupProbe,
+        query_terminal_startup, remaining_timeout, write_query, KeyboardEnhancementProbe,
+        ProbeState, TerminalStartupProbe,
     };
-    use crate::event::{InternalEvent, KeyboardEnhancementFlags, OscColorPayload};
+    use crate::event::{InternalEvent, KeyModifiers, KeyboardEnhancementFlags, OscColorPayload};
     use crate::style::Color;
 
     #[test]
@@ -213,7 +306,7 @@ mod tests {
             payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
         });
         state.record(InternalEvent::PrimaryDeviceAttributes);
-        state.record(InternalEvent::CursorPosition(9, 19));
+        state.record(InternalEvent::ExtendedCursorPosition(9, 19));
         state.record(InternalEvent::OscColor {
             slot: 10,
             payload: OscColorPayload::Rgb { r: 4, g: 5, b: 6 },
@@ -237,7 +330,7 @@ mod tests {
     #[test]
     fn treats_unrecognized_colors_as_responses() {
         let mut state = ProbeState::default();
-        state.record(InternalEvent::CursorPosition(0, 0));
+        state.record(InternalEvent::ExtendedCursorPosition(0, 0));
         state.record(InternalEvent::OscColor {
             slot: 10,
             payload: OscColorPayload::Unrecognized("?".to_string()),
@@ -260,9 +353,27 @@ mod tests {
     }
 
     #[test]
+    fn uses_the_latest_extended_cursor_position_response() {
+        let mut state = ProbeState::default();
+        state.record(InternalEvent::ExtendedCursorPosition(1, 0));
+        state.record(InternalEvent::ExtendedCursorPosition(9, 19));
+
+        assert_eq!(state.into_probe().cursor_position, Some((9, 19)));
+    }
+
+    #[test]
+    fn accepts_a_normal_cursor_response_but_ignores_ambiguous_f3() {
+        let mut state = ProbeState::default();
+        state.record(InternalEvent::CursorPosition(9, 19));
+        state.record(InternalEvent::CursorPositionOrF3(1, 0, KeyModifiers::SHIFT));
+
+        assert_eq!(state.into_probe().cursor_position, Some((9, 19)));
+    }
+
+    #[test]
     fn waits_for_the_keyboard_fallback_after_supported_flags() {
         let mut state = ProbeState::default();
-        state.record(InternalEvent::CursorPosition(0, 0));
+        state.record(InternalEvent::ExtendedCursorPosition(0, 0));
         state.record(InternalEvent::OscColor {
             slot: 10,
             payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
@@ -276,6 +387,8 @@ mod tests {
         ));
 
         assert!(!state.is_complete(KeyboardEnhancementProbe::Query));
+        state.record(InternalEvent::PrimaryDeviceAttributes);
+        assert!(state.is_complete(KeyboardEnhancementProbe::Query));
         assert_eq!(
             state.into_probe().keyboard_enhancement_supported,
             Some(true)
@@ -283,9 +396,9 @@ mod tests {
     }
 
     #[test]
-    fn waits_for_supported_flags_when_the_fallback_arrives_first() {
+    fn completes_when_the_keyboard_fallback_arrives_first() {
         let mut state = ProbeState::default();
-        state.record(InternalEvent::CursorPosition(0, 0));
+        state.record(InternalEvent::ExtendedCursorPosition(0, 0));
         state.record(InternalEvent::OscColor {
             slot: 10,
             payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
@@ -296,7 +409,7 @@ mod tests {
         });
         state.record(InternalEvent::PrimaryDeviceAttributes);
 
-        assert!(!state.is_complete(KeyboardEnhancementProbe::Query));
+        assert!(state.is_complete(KeyboardEnhancementProbe::Query));
         assert_eq!(
             state.into_probe().keyboard_enhancement_supported,
             Some(false)
@@ -315,6 +428,34 @@ mod tests {
         assert_eq!(
             remaining_timeout(started_at, Duration::from_millis(1)),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn does_not_enable_raw_mode_when_the_event_reader_is_locked() {
+        let _reader = crate::event::lock_internal_event_reader();
+
+        assert_eq!(
+            query_terminal_startup(Duration::ZERO, KeyboardEnhancementProbe::Skip).unwrap(),
+            TerminalStartupProbe {
+                cursor_position: None,
+                foreground_color: None,
+                background_color: None,
+                keyboard_enhancement_supported: None,
+            }
+        );
+    }
+
+    #[test]
+    fn does_not_enable_raw_mode_or_send_a_query_for_a_zero_timeout() {
+        assert_eq!(
+            query_terminal_startup(Duration::ZERO, KeyboardEnhancementProbe::Skip).unwrap(),
+            TerminalStartupProbe {
+                cursor_position: None,
+                foreground_color: None,
+                background_color: None,
+                keyboard_enhancement_supported: None,
+            }
         );
     }
 
@@ -341,9 +482,108 @@ mod tests {
         let mut writer = RecordingWriter::default();
         let query = b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\";
 
-        write_query(query, &mut writer).unwrap();
+        write_query(query, &mut writer, Instant::now(), Duration::from_secs(1)).unwrap();
 
         assert_eq!(writer.bytes, query);
         assert!(writer.flushed);
+    }
+
+    #[test]
+    fn terminal_startup_query_does_not_block_on_a_full_output_buffer() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut writer, _reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let chunk = [0_u8; 4096];
+        loop {
+            match writer.write(&chunk) {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("failed to fill test output buffer: {err}"),
+            }
+        }
+        writer.set_nonblocking(false).unwrap();
+        let flags_handle = writer.try_clone().unwrap();
+        #[cfg(feature = "libc")]
+        let writer_fd = {
+            use std::os::unix::io::AsRawFd;
+            crate::terminal::sys::file_descriptor::FileDesc::new(flags_handle.as_raw_fd(), false)
+        };
+        #[cfg(not(feature = "libc"))]
+        let writer_fd = {
+            use rustix::fd::AsFd;
+            crate::terminal::sys::file_descriptor::FileDesc::Borrowed(flags_handle.as_fd())
+        };
+
+        let started_at = Instant::now();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stdout_lock_thread = std::thread::spawn(move || {
+            let _stdout_lock = io::stdout().lock();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let err = {
+            let _nonblocking =
+                crate::terminal::sys::file_descriptor::NonblockingGuard::new(&writer_fd).unwrap();
+            let mut raw_writer = &writer_fd;
+            write_query(
+                b"\x1B[?6n",
+                &mut raw_writer,
+                started_at,
+                Duration::from_millis(5),
+            )
+            .unwrap_err()
+        };
+        release_tx.send(()).unwrap();
+        stdout_lock_thread.join().unwrap();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+        #[cfg(feature = "libc")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Safety: F_GETFL only inspects the supplied file descriptor.
+            let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+        #[cfg(not(feature = "libc"))]
+        assert!(!rustix::fs::fcntl_getfl(&writer)
+            .unwrap()
+            .contains(rustix::fs::OFlags::NONBLOCK));
+    }
+
+    #[test]
+    fn stops_a_partial_terminal_startup_query_when_the_deadline_expires() {
+        #[derive(Default)]
+        struct SlowPartialWriter {
+            writes: usize,
+        }
+
+        impl Write for SlowPartialWriter {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(1)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = SlowPartialWriter::default();
+        let err = write_query(
+            b"\x1B[?6n",
+            &mut writer,
+            Instant::now(),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(writer.writes, 1);
     }
 }

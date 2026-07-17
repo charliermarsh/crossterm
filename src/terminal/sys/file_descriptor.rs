@@ -32,6 +32,77 @@ pub enum FileDesc<'a> {
     Borrowed(BorrowedFd<'a>),
 }
 
+pub(crate) struct NonblockingGuard<'a, 'fd> {
+    fd: &'a FileDesc<'fd>,
+    #[cfg(feature = "libc")]
+    original_flags: libc::c_int,
+    #[cfg(not(feature = "libc"))]
+    original_flags: rustix::fs::OFlags,
+    changed: bool,
+}
+
+impl<'a, 'fd> NonblockingGuard<'a, 'fd> {
+    pub(crate) fn new(fd: &'a FileDesc<'fd>) -> io::Result<Self> {
+        #[cfg(feature = "libc")]
+        let original_flags = {
+            // Safety: F_GETFL only inspects the supplied file descriptor.
+            let flags = unsafe { libc::fcntl(fd.raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            flags
+        };
+        #[cfg(not(feature = "libc"))]
+        let original_flags = rustix::fs::fcntl_getfl(fd)?;
+
+        #[cfg(feature = "libc")]
+        let changed = original_flags & libc::O_NONBLOCK == 0;
+        #[cfg(not(feature = "libc"))]
+        let changed = !original_flags.contains(rustix::fs::OFlags::NONBLOCK);
+
+        if changed {
+            #[cfg(feature = "libc")]
+            {
+                // Safety: F_SETFL updates the supplied file descriptor's status flags.
+                if unsafe {
+                    libc::fcntl(
+                        fd.raw_fd(),
+                        libc::F_SETFL,
+                        original_flags | libc::O_NONBLOCK,
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            #[cfg(not(feature = "libc"))]
+            rustix::fs::fcntl_setfl(fd, original_flags | rustix::fs::OFlags::NONBLOCK)?;
+        }
+
+        Ok(Self {
+            fd,
+            original_flags,
+            changed,
+        })
+    }
+}
+
+impl Drop for NonblockingGuard<'_, '_> {
+    fn drop(&mut self) {
+        if !self.changed {
+            return;
+        }
+
+        #[cfg(feature = "libc")]
+        // Safety: F_SETFL restores the status flags saved for this descriptor.
+        unsafe {
+            libc::fcntl(self.fd.raw_fd(), libc::F_SETFL, self.original_flags);
+        }
+        #[cfg(not(feature = "libc"))]
+        let _ = rustix::fs::fcntl_setfl(self.fd, self.original_flags);
+    }
+}
+
 #[cfg(feature = "libc")]
 impl FileDesc<'_> {
     /// Constructs a new `FileDesc` with the given `RawFd`.
@@ -109,6 +180,32 @@ impl AsRawFd for FileDesc<'_> {
     }
 }
 
+impl io::Write for &FileDesc<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        #[cfg(feature = "libc")]
+        {
+            // Safety: `buffer` is valid for reads of `buffer.len()` bytes.
+            let result = unsafe {
+                libc::write(
+                    self.raw_fd(),
+                    buffer.as_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(result as usize)
+        }
+        #[cfg(not(feature = "libc"))]
+        Ok(rustix::io::write(*self, buffer)?)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(not(feature = "libc"))]
 impl AsFd for FileDesc<'_> {
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -151,4 +248,47 @@ pub fn tty_fd() -> io::Result<FileDesc<'static>> {
         FileDesc::Owned(dev_tty.into())
     };
     Ok(fd)
+}
+
+#[cfg(feature = "libc")]
+/// Creates an independent descriptor for the terminal that supplies input when available.
+pub(crate) fn tty_input_fd() -> io::Result<FileDesc<'static>> {
+    if let Some(path) = tty_input_path() {
+        if let Ok(file) = fs::OpenOptions::new().read(true).open(path) {
+            return Ok(FileDesc::new(file.into_raw_fd(), true));
+        }
+    }
+    tty_fd()
+}
+
+#[cfg(not(feature = "libc"))]
+/// Creates an independent descriptor for the terminal that supplies input when available.
+pub(crate) fn tty_input_fd() -> io::Result<FileDesc<'static>> {
+    use std::fs::File;
+
+    if let Some(path) = tty_input_path() {
+        if let Ok(file) = File::options().read(true).open(path) {
+            return Ok(FileDesc::Owned(file.into()));
+        }
+    }
+    tty_fd()
+}
+
+#[cfg(target_os = "fuchsia")]
+fn tty_input_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+#[cfg(not(target_os = "fuchsia"))]
+fn tty_input_path() -> Option<std::path::PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let stdin = rustix::stdio::stdin();
+    if rustix::termios::isatty(stdin) {
+        let name = rustix::termios::ttyname(stdin, Vec::new()).ok()?;
+        Some(OsStr::from_bytes(name.as_bytes()).into())
+    } else {
+        Some("/dev/tty".into())
+    }
 }

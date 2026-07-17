@@ -17,6 +17,8 @@ use crate::event::{
     filter::EventFilter, lock_internal_event_reader, poll_internal, read_internal, sys::Waker,
     Event, InternalEvent,
 };
+#[cfg(unix)]
+use crate::event::{KeyCode, KeyEvent};
 
 /// A stream of `Result<Event>`.
 ///
@@ -105,6 +107,10 @@ impl Stream for EventStream {
         let result = match poll_internal(Some(Duration::from_secs(0)), &EventFilter) {
             Ok(true) => match read_internal(&EventFilter) {
                 Ok(InternalEvent::Event(event)) => Poll::Ready(Some(Ok(event))),
+                #[cfg(unix)]
+                Ok(InternalEvent::CursorPositionOrF3(_, _, modifiers)) => Poll::Ready(Some(Ok(
+                    Event::Key(KeyEvent::new(KeyCode::F(3), modifiers)),
+                ))),
                 Err(e) => Poll::Ready(Some(Err(e))),
                 #[cfg(unix)]
                 _ => unreachable!(),

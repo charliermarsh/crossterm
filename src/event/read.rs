@@ -33,6 +33,14 @@ impl Default for InternalEventReader {
 }
 
 impl InternalEventReader {
+    pub(crate) fn clear(&mut self) {
+        self.events.clear();
+        self.skipped_events.clear();
+        if let Some(source) = self.source.as_mut() {
+            source.clear();
+        }
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
@@ -139,8 +147,9 @@ mod tests {
     #[cfg(all(unix, feature = "bracketed-paste"))]
     use super::super::filter::TerminalStartupProbeFilter;
     #[cfg(all(unix, feature = "bracketed-paste"))]
+    use super::super::KeyModifiers;
+    #[cfg(all(unix, feature = "bracketed-paste"))]
     use super::super::OscColorPayload;
-    #[cfg(unix)]
     use super::super::{KeyCode, KeyEvent};
     use super::{
         super::{filter::EventFilter as InternalEventFilter, Event},
@@ -297,11 +306,31 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_discards_queued_skipped_and_source_input() {
+        let queued = InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('q'))));
+        let skipped = InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('s'))));
+        let source_event = InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('p'))));
+        let mut reader = InternalEventReader {
+            events: vec![queued].into(),
+            source: Some(Box::new(FakeSource::with_events(&[source_event]))),
+            skipped_events: vec![skipped],
+        };
+
+        reader.clear();
+
+        assert!(reader.events.is_empty());
+        assert!(reader.skipped_events.is_empty());
+        assert!(!reader
+            .poll(Some(Duration::ZERO), &InternalEventFilter)
+            .unwrap());
+    }
+
+    #[test]
     #[cfg(all(unix, feature = "bracketed-paste"))]
     fn test_startup_probe_preserves_interleaved_input_events() {
         let input = [
             InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('h')))),
-            InternalEvent::CursorPosition(9, 19),
+            InternalEvent::ExtendedCursorPosition(9, 19),
             InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Backspace))),
             InternalEvent::OscColor {
                 slot: 10,
@@ -325,7 +354,7 @@ mod tests {
         };
 
         for expected in [
-            InternalEvent::CursorPosition(9, 19),
+            InternalEvent::ExtendedCursorPosition(9, 19),
             InternalEvent::OscColor {
                 slot: 10,
                 payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
@@ -352,6 +381,180 @@ mod tests {
             reader.read(&InternalEventFilter).unwrap(),
             InternalEvent::Event(Event::Paste("hello\nworld".to_string()))
         );
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "bracketed-paste"))]
+    fn test_startup_probe_preserves_modified_f3_order_around_extended_cursor() {
+        let input = parsed_events(
+            b"h\x1B[1;2R\x1B[?20;10;1R\x1B[1;9R\x1B]10;rgb:1111/2222/3333\x07\x1B[200~paste\x1B[201~\x1B]11;rgb:4444/5555/6666\x07\x1B[?64;1c",
+        );
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(FakeSource::with_events(&input))),
+            skipped_events: Vec::with_capacity(32),
+        };
+        let filter = TerminalStartupProbeFilter {
+            query_keyboard: true,
+        };
+
+        for expected in [
+            InternalEvent::ExtendedCursorPosition(9, 19),
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb {
+                    r: 17,
+                    g: 34,
+                    b: 51,
+                },
+            },
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb {
+                    r: 68,
+                    g: 85,
+                    b: 102,
+                },
+            },
+            InternalEvent::PrimaryDeviceAttributes,
+        ] {
+            assert!(reader.poll(Some(Duration::from_secs(1)), &filter).unwrap());
+            assert_eq!(reader.read(&filter).unwrap(), expected);
+        }
+
+        for expected in [
+            InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('h')))),
+            InternalEvent::CursorPositionOrF3(1, 0, KeyModifiers::SHIFT),
+            InternalEvent::CursorPositionOrF3(8, 0, KeyModifiers::SUPER),
+            InternalEvent::Event(Event::Paste("paste".to_string())),
+        ] {
+            assert_eq!(reader.read(&InternalEventFilter).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "bracketed-paste"))]
+    fn test_startup_probe_preserves_modified_f3_when_extended_cursor_is_missing() {
+        let input = parsed_events(
+            b"h\x1B[1;2R\x1B]10;rgb:1111/2222/3333\x07\x1B[1;16R\x1B]11;rgb:4444/5555/6666\x07",
+        );
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(FakeSource::with_events(&input))),
+            skipped_events: Vec::with_capacity(32),
+        };
+        let filter = TerminalStartupProbeFilter {
+            query_keyboard: false,
+        };
+
+        for expected in [
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb {
+                    r: 17,
+                    g: 34,
+                    b: 51,
+                },
+            },
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb {
+                    r: 68,
+                    g: 85,
+                    b: 102,
+                },
+            },
+        ] {
+            assert!(reader.poll(Some(Duration::from_secs(1)), &filter).unwrap());
+            assert_eq!(reader.read(&filter).unwrap(), expected);
+        }
+        assert!(!reader
+            .poll(Some(Duration::from_millis(1)), &filter)
+            .unwrap());
+
+        for expected in [
+            InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('h')))),
+            InternalEvent::CursorPositionOrF3(1, 0, KeyModifiers::SHIFT),
+            InternalEvent::CursorPositionOrF3(
+                15,
+                0,
+                KeyModifiers::SHIFT
+                    | KeyModifiers::ALT
+                    | KeyModifiers::CONTROL
+                    | KeyModifiers::SUPER,
+            ),
+        ] {
+            assert_eq!(reader.read(&InternalEventFilter).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "bracketed-paste"))]
+    fn test_startup_probe_accepts_a_nonambiguous_normal_cursor_fallback() {
+        let input = parsed_events(
+            b"h\x1B[20;10R\x1B[1;2R\x1B]10;rgb:1111/2222/3333\x07\x1B]11;rgb:4444/5555/6666\x07",
+        );
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(FakeSource::with_events(&input))),
+            skipped_events: Vec::with_capacity(32),
+        };
+        let filter = TerminalStartupProbeFilter {
+            query_keyboard: false,
+        };
+
+        for expected in [
+            InternalEvent::CursorPosition(9, 19),
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb {
+                    r: 17,
+                    g: 34,
+                    b: 51,
+                },
+            },
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb {
+                    r: 68,
+                    g: 85,
+                    b: 102,
+                },
+            },
+        ] {
+            assert!(reader.poll(Some(Duration::from_secs(1)), &filter).unwrap());
+            assert_eq!(reader.read(&filter).unwrap(), expected);
+        }
+
+        assert_eq!(
+            reader.read(&InternalEventFilter).unwrap(),
+            InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('h'))))
+        );
+        assert_eq!(
+            reader.read(&InternalEventFilter).unwrap(),
+            InternalEvent::CursorPositionOrF3(1, 0, KeyModifiers::SHIFT)
+        );
+    }
+
+    #[cfg(all(unix, feature = "bracketed-paste"))]
+    fn parsed_events(input: &[u8]) -> Vec<InternalEvent> {
+        let mut buffer = Vec::new();
+        let mut events = Vec::new();
+
+        for (idx, byte) in input.iter().enumerate() {
+            buffer.push(*byte);
+            match crate::event::sys::unix::parse::parse_event(&buffer, idx + 1 < input.len())
+                .unwrap()
+            {
+                Some(event) => {
+                    events.push(event);
+                    buffer.clear();
+                }
+                None => {}
+            }
+        }
+        assert!(buffer.is_empty());
+        events
     }
 
     #[test]
@@ -550,6 +753,11 @@ mod tests {
 
             // Timeout
             Ok(None)
+        }
+
+        fn clear(&mut self) {
+            self.events.clear();
+            self.error = None;
         }
 
         #[cfg(feature = "event-stream")]

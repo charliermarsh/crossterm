@@ -13,8 +13,12 @@ use filedescriptor::{poll, pollfd, POLLIN};
 
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
-use crate::event::{source::EventSource, sys::unix::parse::parse_event, InternalEvent};
-use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
+use crate::event::{
+    source::EventSource,
+    sys::unix::parse::{osc_kind, osc_terminated, parse_event, OscKind, MAX_OSC_SEQUENCE_LEN},
+    InternalEvent,
+};
+use crate::terminal::sys::file_descriptor::{tty_input_fd, FileDesc, NonblockingGuard};
 
 /// Holds a prototypical Waker and a receiver we can wait on when doing select().
 #[cfg(feature = "event-stream")]
@@ -44,8 +48,14 @@ pub(crate) struct UnixInternalEventSource {
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty: FileDesc<'static>,
     winch_signal_receiver: UnixStream,
+    pending_resize: bool,
     #[cfg(feature = "event-stream")]
     wake_pipe: WakePipe,
+}
+
+enum ResizeQuery {
+    Bounded,
+    Unbounded,
 }
 
 fn nonblocking_unix_pair() -> io::Result<(UnixStream, UnixStream)> {
@@ -57,7 +67,7 @@ fn nonblocking_unix_pair() -> io::Result<(UnixStream, UnixStream)> {
 
 impl UnixInternalEventSource {
     pub fn new() -> io::Result<Self> {
-        UnixInternalEventSource::from_file_descriptor(tty_fd()?)
+        UnixInternalEventSource::from_file_descriptor(tty_input_fd()?)
     }
 
     pub(crate) fn from_file_descriptor(input_fd: FileDesc<'static>) -> io::Result<Self> {
@@ -74,9 +84,26 @@ impl UnixInternalEventSource {
                 pipe::register(rustix::process::Signal::Winch as i32, sender)?;
                 receiver
             },
+            pending_resize: false,
             #[cfg(feature = "event-stream")]
             wake_pipe: WakePipe::new()?,
         })
+    }
+
+    fn read_resize(&mut self, query: ResizeQuery) -> io::Result<Option<InternalEvent>> {
+        let (columns, rows) = match query {
+            ResizeQuery::Bounded => match crate::terminal::window_size() {
+                Ok(size) => (size.columns, size.rows),
+                Err(_) => {
+                    self.pending_resize = true;
+                    return Ok(None);
+                }
+            },
+            ResizeQuery::Unbounded => crate::terminal::size()?,
+        };
+
+        self.pending_resize = false;
+        Ok(Some(InternalEvent::Event(Event::Resize(columns, rows))))
     }
 }
 
@@ -100,6 +127,22 @@ fn read_complete(fd: &FileDesc, buf: &mut [u8]) -> io::Result<usize> {
 
 impl EventSource for UnixInternalEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+        if let Some(event) = self.parser.next() {
+            return Ok(Some(event));
+        }
+
+        if self.pending_resize {
+            let query = if timeout.is_some() {
+                ResizeQuery::Bounded
+            } else {
+                ResizeQuery::Unbounded
+            };
+            if let Some(event) = self.read_resize(query)? {
+                return Ok(Some(event));
+            }
+        }
+
+        let bounded = timeout.is_some();
         let timeout = PollTimeout::new(timeout);
 
         fn make_pollfd<F: AsRawFd>(fd: &F) -> pollfd {
@@ -145,9 +188,23 @@ impl EventSource for UnixInternalEventSource {
                 Ok(_) => (),
             };
             if fds[0].revents & POLLIN != 0 {
-                // Terminal descriptors are normally blocking. Read at most once for each
-                // readiness notification so an incomplete sequence cannot block a bounded poll.
-                let read_count = read_complete(&self.tty, &mut self.tty_buffer)?;
+                // Another reader can consume the bytes after `poll` reports readiness. Keep the
+                // descriptor nonblocking only for this read so a stale notification cannot hang
+                // a bounded poll and the terminal's original flags remain intact.
+                let read_result = {
+                    let _nonblocking = NonblockingGuard::new(&self.tty)?;
+                    self.tty.read(&mut self.tty_buffer)
+                };
+                let read_count = match read_result {
+                    Ok(read_count) => read_count,
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 if read_count > 0 {
                     self.parser.advance(
                         &self.tty_buffer[..read_count],
@@ -166,22 +223,23 @@ impl EventSource for UnixInternalEventSource {
                 let fd = FileDesc::Borrowed(self.winch_signal_receiver.as_fd());
                 // drain the pipe
                 while read_complete(&fd, &mut [0; 1024])? != 0 {}
-                // TODO Should we remove tput?
-                //
-                // This can take a really long time, because terminal::size can
-                // launch new process (tput) and then it parses its output. It's
-                // not a really long time from the absolute time point of view, but
-                // it's a really long time from the mio, async-std/tokio executor, ...
-                // point of view.
-                let new_size = crate::terminal::size()?;
-                return Ok(Some(InternalEvent::Event(Event::Resize(
-                    new_size.0, new_size.1,
-                ))));
+                let query = if bounded {
+                    ResizeQuery::Bounded
+                } else {
+                    ResizeQuery::Unbounded
+                };
+                if let Some(event) = self.read_resize(query)? {
+                    return Ok(Some(event));
+                }
+                continue;
             }
 
             #[cfg(feature = "event-stream")]
             if fds[2].revents & POLLIN != 0 {
+                #[cfg(feature = "libc")]
                 let fd = FileDesc::new(self.wake_pipe.receiver.as_raw_fd(), false);
+                #[cfg(not(feature = "libc"))]
+                let fd = FileDesc::Borrowed(self.wake_pipe.receiver.as_fd());
                 // drain the pipe
                 while read_complete(&fd, &mut [0; 1024])? != 0 {}
 
@@ -192,6 +250,20 @@ impl EventSource for UnixInternalEventSource {
             }
         }
         Ok(None)
+    }
+
+    fn clear(&mut self) {
+        self.parser.buffer.clear();
+        self.parser.internal_events.clear();
+        self.parser.discarding_osc = None;
+        self.parser.discarding_osc_esc = false;
+        self.pending_resize = false;
+
+        #[cfg(feature = "libc")]
+        let fd = FileDesc::new(self.winch_signal_receiver.as_raw_fd(), false);
+        #[cfg(not(feature = "libc"))]
+        let fd = FileDesc::Borrowed(self.winch_signal_receiver.as_fd());
+        while matches!(read_complete(&fd, &mut [0; 1024]), Ok(read_count) if read_count != 0) {}
     }
 
     #[cfg(feature = "event-stream")]
@@ -210,6 +282,8 @@ impl EventSource for UnixInternalEventSource {
 struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
+    discarding_osc: Option<OscKind>,
+    discarding_osc_esc: bool,
 }
 
 impl Default for Parser {
@@ -232,6 +306,8 @@ impl Default for Parser {
             // method implementation, all events are consumed before the next TTY_BUFFER
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
+            discarding_osc: None,
+            discarding_osc_esc: false,
         }
     }
 }
@@ -241,7 +317,32 @@ impl Parser {
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
 
+            if let Some(kind) = self.discarding_osc {
+                let terminated = *byte == b'\x07'
+                    || matches!(kind, OscKind::C1) && *byte == 0x9C
+                    || self.discarding_osc_esc && *byte == b'\\';
+                self.discarding_osc_esc = *byte == b'\x1B';
+                if terminated {
+                    self.discarding_osc = None;
+                    self.discarding_osc_esc = false;
+                }
+                continue;
+            }
+
             self.buffer.push(*byte);
+
+            if let Some(kind) = osc_kind(&self.buffer) {
+                if self.buffer.len() >= MAX_OSC_SEQUENCE_LEN && !osc_terminated(&self.buffer, kind)
+                {
+                    self.discarding_osc = Some(kind);
+                    self.discarding_osc_esc = self.buffer.ends_with(b"\x1B");
+                    self.buffer.clear();
+                    continue;
+                }
+                if !osc_terminated(&self.buffer, kind) {
+                    continue;
+                }
+            }
 
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {

@@ -38,8 +38,10 @@ fn read_position_raw() -> io::Result<(u16, u16)> {
     loop {
         match poll_internal(Some(Duration::from_millis(2000)), &CursorPositionFilter) {
             Ok(true) => {
-                if let Ok(InternalEvent::CursorPosition(x, y)) =
-                    read_internal(&CursorPositionFilter)
+                if let Ok(
+                    InternalEvent::CursorPosition(x, y)
+                    | InternalEvent::CursorPositionOrF3(x, y, _),
+                ) = read_internal(&CursorPositionFilter)
                 {
                     return Ok((x, y));
                 }

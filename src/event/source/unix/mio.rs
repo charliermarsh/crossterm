@@ -6,9 +6,12 @@ use signal_hook_mio::v1_0::Signals;
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{
-    source::EventSource, sys::unix::parse::parse_event, timeout::PollTimeout, Event, InternalEvent,
+    source::EventSource,
+    sys::unix::parse::{osc_kind, osc_terminated, parse_event, OscKind, MAX_OSC_SEQUENCE_LEN},
+    timeout::PollTimeout,
+    Event, InternalEvent,
 };
-use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
+use crate::terminal::sys::file_descriptor::{tty_input_fd, FileDesc, NonblockingGuard};
 
 // Tokens to identify file descriptor
 const TTY_TOKEN: Token = Token(0);
@@ -21,6 +24,12 @@ const WAKE_TOKEN: Token = Token(2);
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
 
+#[derive(Clone, Copy)]
+enum ResizeQuery {
+    Bounded,
+    Unbounded,
+}
+
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
     events: Events,
@@ -28,13 +37,14 @@ pub(crate) struct UnixInternalEventSource {
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
     signals: Signals,
+    pending_resize: bool,
     #[cfg(feature = "event-stream")]
     waker: Waker,
 }
 
 impl UnixInternalEventSource {
     pub fn new() -> io::Result<Self> {
-        UnixInternalEventSource::from_file_descriptor(tty_fd()?)
+        UnixInternalEventSource::from_file_descriptor(tty_input_fd()?)
     }
 
     pub(crate) fn from_file_descriptor(input_fd: FileDesc<'static>) -> io::Result<Self> {
@@ -58,9 +68,26 @@ impl UnixInternalEventSource {
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
             signals,
+            pending_resize: false,
             #[cfg(feature = "event-stream")]
             waker,
         })
+    }
+
+    fn read_resize(&mut self, query: ResizeQuery) -> io::Result<Option<InternalEvent>> {
+        let (columns, rows) = match query {
+            ResizeQuery::Bounded => match crate::terminal::window_size() {
+                Ok(size) => (size.columns, size.rows),
+                Err(_) => {
+                    self.pending_resize = true;
+                    return Ok(None);
+                }
+            },
+            ResizeQuery::Unbounded => crate::terminal::size()?,
+        };
+
+        self.pending_resize = false;
+        Ok(Some(InternalEvent::Event(Event::Resize(columns, rows))))
     }
 }
 
@@ -70,14 +97,60 @@ impl EventSource for UnixInternalEventSource {
             return Ok(Some(event));
         }
 
+        let resize_query = if timeout.is_some() {
+            ResizeQuery::Bounded
+        } else {
+            ResizeQuery::Unbounded
+        };
+        if self.pending_resize {
+            if let Some(event) = self.read_resize(resize_query)? {
+                return Ok(Some(event));
+            }
+        }
+
         let timeout = PollTimeout::new(timeout);
 
         loop {
+            // Mio readiness is edge-triggered. Drain the descriptor before polling so unread
+            // bytes cannot be stranded behind an already-consumed readiness notification.
+            loop {
+                let read_result = {
+                    let _nonblocking = NonblockingGuard::new(&self.tty_fd)?;
+                    self.tty_fd.read(&mut self.tty_buffer)
+                };
+                match read_result {
+                    Ok(0) => return Ok(None),
+                    Ok(read_count) => {
+                        self.parser.advance(
+                            &self.tty_buffer[..read_count],
+                            read_count == TTY_BUFFER_SIZE,
+                        );
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+
+                if let Some(event) = self.parser.next() {
+                    return Ok(Some(event));
+                }
+                if timeout.elapsed() {
+                    return Ok(None);
+                }
+            }
+
+            if timeout.elapsed() {
+                return Ok(None);
+            }
+
             if let Err(e) = self.poll.poll(&mut self.events, timeout.leftover()) {
                 // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
                 // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
                 // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
                 if e.kind() == io::ErrorKind::Interrupted {
+                    if timeout.elapsed() {
+                        return Ok(None);
+                    }
                     continue;
                 } else {
                     return Err(e);
@@ -89,54 +162,11 @@ impl EventSource for UnixInternalEventSource {
                 return Ok(None);
             }
 
+            let mut signal_ready = false;
             for token in self.events.iter().map(|x| x.token()) {
                 match token {
-                    TTY_TOKEN => {
-                        // Terminal descriptors are normally blocking. Read at most once for
-                        // each readiness notification so an incomplete sequence cannot block a
-                        // bounded poll while it waits for its next byte.
-                        match self.tty_fd.read(&mut self.tty_buffer) {
-                            Ok(read_count) => {
-                                if read_count > 0 {
-                                    self.parser.advance(
-                                        &self.tty_buffer[..read_count],
-                                        read_count == TTY_BUFFER_SIZE,
-                                    );
-
-                                    // Mio readiness is edge-triggered. Re-arm it before polling
-                                    // again in case this read left more input in the tty buffer.
-                                    let tty_raw_fd = self.tty_fd.raw_fd();
-                                    self.poll.registry().reregister(
-                                        &mut SourceFd(&tty_raw_fd),
-                                        TTY_TOKEN,
-                                        Interest::READABLE,
-                                    )?;
-                                }
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                            Err(e) => return Err(e),
-                        };
-
-                        if let Some(event) = self.parser.next() {
-                            return Ok(Some(event));
-                        }
-                    }
-                    SIGNAL_TOKEN => {
-                        if self.signals.pending().next() == Some(signal_hook::consts::SIGWINCH) {
-                            // TODO Should we remove tput?
-                            //
-                            // This can take a really long time, because terminal::size can
-                            // launch new process (tput) and then it parses its output. It's
-                            // not a really long time from the absolute time point of view, but
-                            // it's a really long time from the mio, async-std/tokio executor, ...
-                            // point of view.
-                            let new_size = crate::terminal::size()?;
-                            return Ok(Some(InternalEvent::Event(Event::Resize(
-                                new_size.0, new_size.1,
-                            ))));
-                        }
-                    }
+                    TTY_TOKEN => {}
+                    SIGNAL_TOKEN => signal_ready = true,
                     #[cfg(feature = "event-stream")]
                     WAKE_TOKEN => {
                         return Err(std::io::Error::new(
@@ -148,11 +178,28 @@ impl EventSource for UnixInternalEventSource {
                 }
             }
 
+            if signal_ready && self.signals.pending().next() == Some(signal_hook::consts::SIGWINCH)
+            {
+                if let Some(event) = self.read_resize(resize_query)? {
+                    return Ok(Some(event));
+                }
+            }
+
             // Processing above can take some time, check if timeout expired
             if timeout.elapsed() {
                 return Ok(None);
             }
         }
+    }
+
+    fn clear(&mut self) {
+        self.parser.buffer.clear();
+        self.parser.internal_events.clear();
+        self.parser.discarding_osc = None;
+        self.parser.discarding_osc_esc = false;
+        self.pending_resize = false;
+        self.events.clear();
+        for _ in self.signals.pending() {}
     }
 
     #[cfg(feature = "event-stream")]
@@ -171,6 +218,8 @@ impl EventSource for UnixInternalEventSource {
 struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
+    discarding_osc: Option<OscKind>,
+    discarding_osc_esc: bool,
 }
 
 impl Default for Parser {
@@ -193,6 +242,8 @@ impl Default for Parser {
             // method implementation, all events are consumed before the next TTY_BUFFER
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
+            discarding_osc: None,
+            discarding_osc_esc: false,
         }
     }
 }
@@ -202,7 +253,32 @@ impl Parser {
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
 
+            if let Some(kind) = self.discarding_osc {
+                let terminated = *byte == b'\x07'
+                    || kind == OscKind::C1 && *byte == 0x9C
+                    || self.discarding_osc_esc && *byte == b'\\';
+                self.discarding_osc_esc = *byte == b'\x1B';
+                if terminated {
+                    self.discarding_osc = None;
+                    self.discarding_osc_esc = false;
+                }
+                continue;
+            }
+
             self.buffer.push(*byte);
+
+            if let Some(kind) = osc_kind(&self.buffer) {
+                if self.buffer.len() >= MAX_OSC_SEQUENCE_LEN && !osc_terminated(&self.buffer, kind)
+                {
+                    self.discarding_osc = Some(kind);
+                    self.discarding_osc_esc = self.buffer.ends_with(b"\x1B");
+                    self.buffer.clear();
+                    continue;
+                }
+                if !osc_terminated(&self.buffer, kind) {
+                    continue;
+                }
+            }
 
             match parse_event(&self.buffer, more) {
                 Ok(Some(ie)) => {

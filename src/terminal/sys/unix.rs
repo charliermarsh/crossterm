@@ -65,7 +65,7 @@ pub(crate) fn window_size() -> io::Result<WindowSize> {
         ws_ypixel: 0,
     };
 
-    let file = File::open("/dev/tty").map(|file| (FileDesc::new(file.into_raw_fd(), true)));
+    let file = File::open("/dev/tty").map(|file| FileDesc::new(file.into_raw_fd(), true));
     let fd = if let Ok(file) = &file {
         file.raw_fd()
     } else {
@@ -82,7 +82,7 @@ pub(crate) fn window_size() -> io::Result<WindowSize> {
 
 #[cfg(not(feature = "libc"))]
 pub(crate) fn window_size() -> io::Result<WindowSize> {
-    let file = File::open("/dev/tty").map(|file| (FileDesc::Owned(file.into())));
+    let file = File::open("/dev/tty").map(|file| FileDesc::Owned(file.into()));
     let fd = if let Ok(file) = &file {
         file.as_fd()
     } else {
@@ -104,9 +104,14 @@ pub(crate) fn size() -> io::Result<(u16, u16)> {
 
 #[cfg(feature = "libc")]
 pub(crate) fn enable_raw_mode() -> io::Result<()> {
+    enable_raw_mode_if_needed().map(|_| ())
+}
+
+#[cfg(feature = "libc")]
+pub(crate) fn enable_raw_mode_if_needed() -> io::Result<bool> {
     let mut original_mode = TERMINAL_MODE_PRIOR_RAW_MODE.lock();
     if original_mode.is_some() {
-        return Ok(());
+        return Ok(false);
     }
 
     let tty = tty_fd()?;
@@ -117,14 +122,19 @@ pub(crate) fn enable_raw_mode() -> io::Result<()> {
     set_terminal_attr(fd, &ios)?;
     // Keep it last - set the original mode only if we were able to switch to the raw mode
     *original_mode = Some(original_mode_ios);
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(feature = "libc"))]
 pub(crate) fn enable_raw_mode() -> io::Result<()> {
+    enable_raw_mode_if_needed().map(|_| ())
+}
+
+#[cfg(not(feature = "libc"))]
+pub(crate) fn enable_raw_mode_if_needed() -> io::Result<bool> {
     let mut original_mode = TERMINAL_MODE_PRIOR_RAW_MODE.lock();
     if original_mode.is_some() {
-        return Ok(());
+        return Ok(false);
     }
 
     let tty = tty_fd()?;
@@ -134,7 +144,7 @@ pub(crate) fn enable_raw_mode() -> io::Result<()> {
     set_terminal_attr(&tty, &ios)?;
     // Keep it last - set the original mode only if we were able to switch to the raw mode
     *original_mode = Some(original_mode_ios);
-    Ok(())
+    Ok(true)
 }
 
 /// Reset the raw mode.

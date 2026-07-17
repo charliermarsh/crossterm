@@ -13,7 +13,10 @@ pub(crate) struct CursorPositionFilter;
 #[cfg(unix)]
 impl Filter for CursorPositionFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
-        matches!(*event, InternalEvent::CursorPosition(_, _))
+        matches!(
+            *event,
+            InternalEvent::CursorPosition(_, _) | InternalEvent::CursorPositionOrF3(_, _, _)
+        )
     }
 }
 
@@ -73,7 +76,9 @@ impl Filter for TerminalStartupProbeFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
         matches!(
             *event,
-            InternalEvent::CursorPosition(_, _) | InternalEvent::OscColor { slot: 10 | 11, .. }
+            InternalEvent::CursorPosition(_, _)
+                | InternalEvent::ExtendedCursorPosition(_, _)
+                | InternalEvent::OscColor { slot: 10 | 11, .. }
         ) || self.query_keyboard
             && matches!(
                 *event,
@@ -88,7 +93,10 @@ pub(crate) struct EventFilter;
 impl Filter for EventFilter {
     #[cfg(unix)]
     fn eval(&self, event: &InternalEvent) -> bool {
-        matches!(*event, InternalEvent::Event(_))
+        matches!(
+            *event,
+            InternalEvent::Event(_) | InternalEvent::CursorPositionOrF3(_, _, _)
+        )
     }
 
     #[cfg(windows)]
@@ -121,6 +129,13 @@ mod tests {
     fn test_cursor_position_filter_filters_cursor_position() {
         assert!(!CursorPositionFilter.eval(&InternalEvent::Event(Event::Resize(10, 10))));
         assert!(CursorPositionFilter.eval(&InternalEvent::CursorPosition(0, 0)));
+        assert!(
+            CursorPositionFilter.eval(&InternalEvent::CursorPositionOrF3(
+                1,
+                0,
+                crate::event::KeyModifiers::SHIFT,
+            ))
+        );
     }
 
     #[test]
@@ -157,7 +172,13 @@ mod tests {
         let filter = TerminalStartupProbeFilter {
             query_keyboard: true,
         };
+        assert!(filter.eval(&InternalEvent::ExtendedCursorPosition(1, 2)));
         assert!(filter.eval(&InternalEvent::CursorPosition(1, 2)));
+        assert!(!filter.eval(&InternalEvent::CursorPositionOrF3(
+            1,
+            0,
+            crate::event::KeyModifiers::SHIFT,
+        )));
         assert!(filter.eval(&OscColor { slot: 10, payload }));
         assert!(filter.eval(&InternalEvent::KeyboardEnhancementFlags(
             crate::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -182,6 +203,11 @@ mod tests {
     fn test_event_filter_filters_events() {
         assert!(EventFilter.eval(&InternalEvent::Event(Event::Resize(10, 10))));
         assert!(!EventFilter.eval(&InternalEvent::CursorPosition(0, 0)));
+        assert!(EventFilter.eval(&InternalEvent::CursorPositionOrF3(
+            1,
+            0,
+            crate::event::KeyModifiers::SHIFT,
+        )));
     }
 
     #[test]

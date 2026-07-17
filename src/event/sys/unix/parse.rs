@@ -24,14 +24,46 @@ fn could_not_parse_event_error() -> io::Error {
     io::Error::new(io::ErrorKind::Other, "Could not parse an event.")
 }
 
-fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
-    debug_assert!(buffer.starts_with(b"\x1B]"));
+pub(crate) const MAX_OSC_SEQUENCE_LEN: usize = 4_096;
 
-    let Some(content_end) = osc_payload_end(buffer) else {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OscKind {
+    SevenBit,
+    C1,
+}
+
+pub(crate) fn osc_kind(buffer: &[u8]) -> Option<OscKind> {
+    if buffer.starts_with(b"\x1B]") {
+        Some(OscKind::SevenBit)
+    } else if buffer.starts_with(b"\x9D") {
+        Some(OscKind::C1)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn osc_terminated(buffer: &[u8], kind: OscKind) -> bool {
+    buffer.ends_with(b"\x07")
+        || buffer.ends_with(b"\x1B\\")
+        || kind == OscKind::C1 && buffer.ends_with(b"\x9C")
+}
+
+fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    let kind = osc_kind(buffer).ok_or_else(could_not_parse_event_error)?;
+    let payload_start = match kind {
+        OscKind::SevenBit => 2,
+        OscKind::C1 => 1,
+    };
+
+    if buffer.len() > MAX_OSC_SEQUENCE_LEN {
+        return Err(could_not_parse_event_error());
+    }
+
+    let Some(content_end) = osc_payload_end(buffer, payload_start, kind) else {
         return Ok(None);
     };
 
-    let text = String::from_utf8_lossy(&buffer[2..content_end]);
+    let text = String::from_utf8_lossy(&buffer[payload_start..content_end]);
     let mut parts = text.splitn(2, ';');
 
     let slot = match parts.next().unwrap_or("").parse::<u16>() {
@@ -53,11 +85,12 @@ fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     Ok(Some(InternalEvent::OscColor { slot, payload }))
 }
 
-fn osc_payload_end(buffer: &[u8]) -> Option<usize> {
-    let mut idx = 2;
+fn osc_payload_end(buffer: &[u8], payload_start: usize, kind: OscKind) -> Option<usize> {
+    let mut idx = payload_start;
     while idx < buffer.len() {
         match buffer[idx] {
             0x07 => return Some(idx),
+            0x9C if kind == OscKind::C1 => return Some(idx),
             0x1B => {
                 if idx + 1 >= buffer.len() {
                     return None;
@@ -82,6 +115,9 @@ pub(crate) fn parse_event(
     }
 
     match buffer[0] {
+        0x8F => parse_ss3(&buffer[1..]),
+        0x9B => parse_csi(buffer),
+        0x9D => parse_osc(buffer),
         b'\x1B' => {
             if buffer.len() == 1 {
                 if input_available {
@@ -92,37 +128,7 @@ pub(crate) fn parse_event(
                 }
             } else {
                 match buffer[1] {
-                    b'O' => {
-                        if buffer.len() == 2 {
-                            Ok(None)
-                        } else {
-                            match buffer[2] {
-                                b'D' => {
-                                    Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Left.into()))))
-                                }
-                                b'C' => Ok(Some(InternalEvent::Event(Event::Key(
-                                    KeyCode::Right.into(),
-                                )))),
-                                b'A' => {
-                                    Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Up.into()))))
-                                }
-                                b'B' => {
-                                    Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Down.into()))))
-                                }
-                                b'H' => {
-                                    Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Home.into()))))
-                                }
-                                b'F' => {
-                                    Ok(Some(InternalEvent::Event(Event::Key(KeyCode::End.into()))))
-                                }
-                                // F1-F4
-                                val @ b'P'..=b'S' => Ok(Some(InternalEvent::Event(Event::Key(
-                                    KeyCode::F(1 + val - b'P').into(),
-                                )))),
-                                _ => Err(could_not_parse_event_error()),
-                            }
-                        }
-                    }
+                    b'O' => parse_ss3(&buffer[2..]),
                     b'[' => parse_csi(buffer),
                     b']' => parse_osc(buffer),
                     b'\x1B' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))),
@@ -176,6 +182,25 @@ pub(crate) fn parse_event(
     }
 }
 
+fn parse_ss3(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    let Some(&key) = buffer.first() else {
+        return Ok(None);
+    };
+
+    let keycode = match key {
+        b'D' => KeyCode::Left,
+        b'C' => KeyCode::Right,
+        b'A' => KeyCode::Up,
+        b'B' => KeyCode::Down,
+        b'H' => KeyCode::Home,
+        b'F' => KeyCode::End,
+        val @ b'P'..=b'S' => KeyCode::F(1 + val - b'P'),
+        _ => return Err(could_not_parse_event_error()),
+    };
+
+    Ok(Some(InternalEvent::Event(Event::Key(keycode.into()))))
+}
+
 // converts KeyCode to KeyEvent (adds shift modifier in case of uppercase characters)
 fn char_code_to_event(code: KeyCode) -> KeyEvent {
     let modifiers = match code {
@@ -186,18 +211,18 @@ fn char_code_to_event(code: KeyCode) -> KeyEvent {
 }
 
 pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
-    assert!(buffer.starts_with(&[b'\x1B', b'['])); // ESC [
+    let payload = csi_payload(buffer);
 
-    if buffer.len() == 2 {
+    if payload.is_empty() {
         return Ok(None);
     }
 
-    let input_event = match buffer[2] {
+    let input_event = match payload[0] {
         b'[' => {
-            if buffer.len() == 3 {
+            if payload.len() == 1 {
                 None
             } else {
-                match buffer[3] {
+                match payload[1] {
                     // NOTE (@imdaveho): cannot find when this occurs;
                     // having another '[' after ESC[ not a likely scenario
                     val @ b'A'..=b'E' => Some(Event::Key(KeyCode::F(1 + val - b'A').into())),
@@ -228,24 +253,25 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         b'P' => Some(Event::Key(KeyCode::F(1).into())),
         b'Q' => Some(Event::Key(KeyCode::F(2).into())),
         b'S' => Some(Event::Key(KeyCode::F(4).into())),
-        b'?' => match buffer[buffer.len() - 1] {
+        b'?' => match payload[payload.len() - 1] {
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
+            b'R' => return parse_csi_extended_cursor_position(buffer),
             _ => None,
         },
         b'0'..=b'9' => {
             // Numbered escape code.
-            if buffer.len() == 3 {
+            if payload.len() == 1 {
                 None
             } else {
                 // The final byte of a CSI sequence can be in the range 64-126, so
                 // let's keep reading anything else.
-                let last_byte = buffer[buffer.len() - 1];
+                let last_byte = payload[payload.len() - 1];
                 if !(64..=126).contains(&last_byte) {
                     None
                 } else {
                     #[cfg(feature = "bracketed-paste")]
-                    if buffer.starts_with(b"\x1B[200~") {
+                    if payload.starts_with(b"200~") {
                         return parse_csi_bracketed_paste(buffer);
                     }
                     match last_byte {
@@ -262,6 +288,16 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     };
 
     Ok(input_event.map(InternalEvent::Event))
+}
+
+fn csi_payload(buffer: &[u8]) -> &[u8] {
+    if let Some(payload) = buffer.strip_prefix(b"\x1B[") {
+        payload
+    } else if let Some(payload) = buffer.strip_prefix(b"\x9B") {
+        payload
+    } else {
+        panic!("CSI sequence must start with ESC [ or 0x9B")
+    }
 }
 
 pub(crate) fn next_parsed<T>(iter: &mut dyn Iterator<Item = &str>) -> io::Result<T>
@@ -293,10 +329,10 @@ pub(crate) fn parse_csi_cursor_position(buffer: &[u8]) -> io::Result<Option<Inte
     // ESC [ Cy ; Cx R
     //   Cy - cursor row number (starting from 1)
     //   Cx - cursor column number (starting from 1)
-    assert!(buffer.starts_with(&[b'\x1B', b'['])); // ESC [
-    assert!(buffer.ends_with(&[b'R']));
+    let payload = csi_payload(buffer);
+    assert!(payload.ends_with(&[b'R']));
 
-    let s = std::str::from_utf8(&buffer[2..buffer.len() - 1])
+    let s = std::str::from_utf8(&payload[..payload.len() - 1])
         .map_err(|_| could_not_parse_event_error())?;
 
     let mut split = s.split(';');
@@ -304,19 +340,49 @@ pub(crate) fn parse_csi_cursor_position(buffer: &[u8]) -> io::Result<Option<Inte
     let y = next_parsed::<u16>(&mut split)?.saturating_sub(1);
     let x = next_parsed::<u16>(&mut split)?.saturating_sub(1);
 
-    Ok(Some(InternalEvent::CursorPosition(x, y)))
+    if y == 0 && (1..=15).contains(&x) {
+        Ok(Some(InternalEvent::CursorPositionOrF3(
+            x,
+            y,
+            parse_modifiers(x as u8 + 1),
+        )))
+    } else {
+        Ok(Some(InternalEvent::CursorPosition(x, y)))
+    }
+}
+
+fn parse_csi_extended_cursor_position(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    let payload = csi_payload(buffer);
+    assert!(payload.starts_with(&[b'?']));
+    assert!(payload.ends_with(&[b'R']));
+
+    let mut split = std::str::from_utf8(&payload[1..payload.len() - 1])
+        .map_err(|_| could_not_parse_event_error())?
+        .split(';');
+    let y = next_parsed::<u16>(&mut split)?.saturating_sub(1);
+    let x = next_parsed::<u16>(&mut split)?.saturating_sub(1);
+    if let Some(page) = split.next() {
+        page.parse::<u16>()
+            .map_err(|_| could_not_parse_event_error())?;
+    }
+    if split.next().is_some() {
+        return Err(could_not_parse_event_error());
+    }
+
+    Ok(Some(InternalEvent::ExtendedCursorPosition(x, y)))
 }
 
 fn parse_csi_keyboard_enhancement_flags(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     // ESC [ ? flags u
-    assert!(buffer.starts_with(&[b'\x1B', b'[', b'?'])); // ESC [ ?
-    assert!(buffer.ends_with(&[b'u']));
+    let payload = csi_payload(buffer);
+    assert!(payload.starts_with(&[b'?']));
+    assert!(payload.ends_with(&[b'u']));
 
-    if buffer.len() < 5 {
+    if payload.len() < 3 {
         return Ok(None);
     }
 
-    let bits = buffer[3];
+    let bits = payload[1];
     let mut flags = KeyboardEnhancementFlags::empty();
 
     if bits & 1 != 0 {
@@ -341,8 +407,9 @@ fn parse_csi_keyboard_enhancement_flags(buffer: &[u8]) -> io::Result<Option<Inte
 
 fn parse_csi_primary_device_attributes(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     // ESC [ 64 ; attr1 ; attr2 ; ... ; attrn ; c
-    assert!(buffer.starts_with(&[b'\x1B', b'[', b'?']));
-    assert!(buffer.ends_with(&[b'c']));
+    let payload = csi_payload(buffer);
+    assert!(payload.starts_with(&[b'?']));
+    assert!(payload.ends_with(&[b'c']));
 
     // This is a stub for parsing the primary device attributes. This response is not
     // exposed in the crossterm API so we don't need to parse the individual attributes yet.
@@ -397,9 +464,8 @@ fn parse_key_event_kind(kind: u8) -> KeyEventKind {
 }
 
 pub(crate) fn parse_csi_modifier_key_code(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
-    assert!(buffer.starts_with(&[b'\x1B', b'['])); // ESC [
-                                                   //
-    let s = std::str::from_utf8(&buffer[2..buffer.len() - 1])
+    let payload = csi_payload(buffer);
+    let s = std::str::from_utf8(&payload[..payload.len() - 1])
         .map_err(|_| could_not_parse_event_error())?;
     let mut split = s.split(';');
 
@@ -411,10 +477,10 @@ pub(crate) fn parse_csi_modifier_key_code(buffer: &[u8]) -> io::Result<Option<In
                 parse_modifiers(modifier_mask),
                 parse_key_event_kind(kind_code),
             )
-        } else if buffer.len() > 3 {
+        } else if payload.len() > 1 {
             (
                 parse_modifiers(
-                    (buffer[buffer.len() - 2] as char)
+                    (payload[payload.len() - 2] as char)
                         .to_digit(10)
                         .ok_or_else(could_not_parse_event_error)? as u8,
                 ),
@@ -423,7 +489,7 @@ pub(crate) fn parse_csi_modifier_key_code(buffer: &[u8]) -> io::Result<Option<In
         } else {
             (KeyModifiers::NONE, KeyEventKind::Press)
         };
-    let key = buffer[buffer.len() - 1];
+    let key = payload[payload.len() - 1];
 
     let keycode = match key {
         b'A' => KeyCode::Up,
@@ -546,14 +612,14 @@ fn translate_functional_key_code(codepoint: u32) -> Option<(KeyCode, KeyEventSta
 }
 
 pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
-    assert!(buffer.starts_with(&[b'\x1B', b'['])); // ESC [
-    assert!(buffer.ends_with(&[b'u']));
+    let payload = csi_payload(buffer);
+    assert!(payload.ends_with(&[b'u']));
 
     // This function parses `CSI … u` sequences. These are sequences defined in either
     // the `CSI u` (a.k.a. "Fix Keyboard Input on Terminals - Please", https://www.leonerd.org.uk/hacks/fixterms/)
     // or Kitty Keyboard Protocol (https://sw.kovidgoyal.net/kitty/keyboard-protocol/) specifications.
     // This CSI sequence is a tuple of semicolon-separated numbers.
-    let s = std::str::from_utf8(&buffer[2..buffer.len() - 1])
+    let s = std::str::from_utf8(&payload[..payload.len() - 1])
         .map_err(|_| could_not_parse_event_error())?;
     let mut split = s.split(';');
 
@@ -668,10 +734,10 @@ pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<I
 }
 
 pub(crate) fn parse_csi_special_key_code(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
-    assert!(buffer.starts_with(&[b'\x1B', b'['])); // ESC [
-    assert!(buffer.ends_with(&[b'~']));
+    let payload = csi_payload(buffer);
+    assert!(payload.ends_with(&[b'~']));
 
-    let s = std::str::from_utf8(&buffer[2..buffer.len() - 1])
+    let s = std::str::from_utf8(&payload[..payload.len() - 1])
         .map_err(|_| could_not_parse_event_error())?;
     let mut split = s.split(';');
 
@@ -715,10 +781,10 @@ pub(crate) fn parse_csi_rxvt_mouse(buffer: &[u8]) -> io::Result<Option<InternalE
     // rxvt mouse encoding:
     // ESC [ Cb ; Cx ; Cy ; M
 
-    assert!(buffer.starts_with(&[b'\x1B', b'['])); // ESC [
-    assert!(buffer.ends_with(&[b'M']));
+    let payload = csi_payload(buffer);
+    assert!(payload.ends_with(&[b'M']));
 
-    let s = std::str::from_utf8(&buffer[2..buffer.len() - 1])
+    let s = std::str::from_utf8(&payload[..payload.len() - 1])
         .map_err(|_| could_not_parse_event_error())?;
     let mut split = s.split(';');
 
@@ -741,13 +807,14 @@ pub(crate) fn parse_csi_rxvt_mouse(buffer: &[u8]) -> io::Result<Option<InternalE
 pub(crate) fn parse_csi_normal_mouse(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     // Normal mouse encoding: ESC [ M CB Cx Cy (6 characters only).
 
-    assert!(buffer.starts_with(&[b'\x1B', b'[', b'M'])); // ESC [ M
+    let payload = csi_payload(buffer);
+    assert!(payload.starts_with(&[b'M']));
 
-    if buffer.len() < 6 {
+    if payload.len() < 4 {
         return Ok(None);
     }
 
-    let cb = buffer[3]
+    let cb = payload[1]
         .checked_sub(32)
         .ok_or_else(could_not_parse_event_error)?;
     let (kind, modifiers) = parse_cb(cb)?;
@@ -755,8 +822,8 @@ pub(crate) fn parse_csi_normal_mouse(buffer: &[u8]) -> io::Result<Option<Interna
     // See http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking
     // The upper left character position on the terminal is denoted as 1,1.
     // Subtract 1 to keep it synced with cursor
-    let cx = u16::from(buffer[4].saturating_sub(32)) - 1;
-    let cy = u16::from(buffer[5].saturating_sub(32)) - 1;
+    let cx = u16::from(payload[2].saturating_sub(32)) - 1;
+    let cy = u16::from(payload[3].saturating_sub(32)) - 1;
 
     Ok(Some(InternalEvent::Event(Event::Mouse(MouseEvent {
         kind,
@@ -769,13 +836,14 @@ pub(crate) fn parse_csi_normal_mouse(buffer: &[u8]) -> io::Result<Option<Interna
 pub(crate) fn parse_csi_sgr_mouse(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     // ESC [ < Cb ; Cx ; Cy (;) (M or m)
 
-    assert!(buffer.starts_with(&[b'\x1B', b'[', b'<'])); // ESC [ <
+    let payload = csi_payload(buffer);
+    assert!(payload.starts_with(&[b'<']));
 
-    if !buffer.ends_with(&[b'm']) && !buffer.ends_with(&[b'M']) {
+    if !payload.ends_with(&[b'm']) && !payload.ends_with(&[b'M']) {
         return Ok(None);
     }
 
-    let s = std::str::from_utf8(&buffer[3..buffer.len() - 1])
+    let s = std::str::from_utf8(&payload[1..payload.len() - 1])
         .map_err(|_| could_not_parse_event_error())?;
     let mut split = s.split(';');
 
@@ -794,7 +862,7 @@ pub(crate) fn parse_csi_sgr_mouse(buffer: &[u8]) -> io::Result<Option<InternalEv
     //
     // We've already checked that the last character is a lowercase or uppercase M at the start of
     // this function, so we just need one if.
-    let kind = if buffer.last() == Some(&b'm') {
+    let kind = if payload.last() == Some(&b'm') {
         match kind {
             MouseEventKind::Down(button) => MouseEventKind::Up(button),
             other => other,
@@ -863,14 +931,19 @@ fn parse_cb(cb: u8) -> io::Result<(MouseEventKind, KeyModifiers)> {
 #[cfg(feature = "bracketed-paste")]
 pub(crate) fn parse_csi_bracketed_paste(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
     // ESC [ 2 0 0 ~ pasted text ESC 2 0 1 ~
-    assert!(buffer.starts_with(b"\x1B[200~"));
+    let payload = csi_payload(buffer);
+    assert!(payload.starts_with(b"200~"));
 
-    if !buffer.ends_with(b"\x1b[201~") {
-        Ok(None)
+    let terminator_len = if buffer.ends_with(b"\x1B[201~") {
+        6
+    } else if buffer.ends_with(b"\x9B201~") {
+        5
     } else {
-        let paste = String::from_utf8_lossy(&buffer[6..buffer.len() - 6]).to_string();
-        Ok(Some(InternalEvent::Event(Event::Paste(paste))))
-    }
+        return Ok(None);
+    };
+
+    let paste = String::from_utf8_lossy(&payload[4..payload.len() - terminator_len]).to_string();
+    Ok(Some(InternalEvent::Event(Event::Paste(paste))))
 }
 
 pub(crate) fn parse_utf8_char(buffer: &[u8]) -> io::Result<Option<char>> {
@@ -1069,6 +1142,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_csi_extended_cursor_position() {
+        for sequence in [
+            b"\x1B[?20;10R".as_slice(),
+            b"\x1B[?20;10;1R".as_slice(),
+            b"\x9B?20;10;1R".as_slice(),
+        ] {
+            assert_eq!(
+                parse_event(sequence, false).unwrap(),
+                Some(InternalEvent::ExtendedCursorPosition(9, 19))
+            );
+        }
+        assert!(parse_event(b"\x1B[?20;10;badR", false).is_err());
+    }
+
+    #[test]
+    fn test_parse_xterm_modified_f3_cursor_collision() {
+        for modifier_code in 2_u8..=16 {
+            let sequence = format!("\x1B[1;{modifier_code}R");
+            assert_eq!(
+                parse_event(sequence.as_bytes(), false).unwrap(),
+                Some(InternalEvent::CursorPositionOrF3(
+                    u16::from(modifier_code - 1),
+                    0,
+                    parse_modifiers(modifier_code),
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_csi() {
         assert_eq!(
             parse_csi(b"\x1B[D").unwrap(),
@@ -1117,6 +1220,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_8_bit_ss3_function_and_cursor_keys() {
+        assert_eq!(parse_event(b"\x8F", true).unwrap(), None);
+
+        for (suffix, keycode) in [
+            (b'A', KeyCode::Up),
+            (b'B', KeyCode::Down),
+            (b'C', KeyCode::Right),
+            (b'D', KeyCode::Left),
+            (b'H', KeyCode::Home),
+            (b'F', KeyCode::End),
+            (b'P', KeyCode::F(1)),
+            (b'Q', KeyCode::F(2)),
+            (b'R', KeyCode::F(3)),
+            (b'S', KeyCode::F(4)),
+        ] {
+            assert_eq!(
+                parse_event(&[0x8F, suffix], false).unwrap(),
+                Some(InternalEvent::Event(Event::Key(keycode.into())))
+            );
+        }
+    }
+
     #[cfg(feature = "bracketed-paste")]
     #[test]
     fn test_parse_csi_bracketed_paste() {
@@ -1134,6 +1260,14 @@ mod tests {
         assert_eq!(
             parse_event(b"\x1B[200~o\x1B[2D\x1B[201~", false).unwrap(),
             Some(InternalEvent::Event(Event::Paste("o\x1B[2D".to_string())))
+        );
+        assert_eq!(
+            parse_event(b"\x9B200~hello \xF0\x9F\x8C\x8D\x9B201~", false).unwrap(),
+            Some(InternalEvent::Event(Event::Paste("hello 🌍".to_string())))
+        );
+        assert_eq!(
+            parse_event(b"\x9B200~hello\x1B[201~", false).unwrap(),
+            Some(InternalEvent::Event(Event::Paste("hello".to_string())))
         );
     }
 
@@ -1608,6 +1742,117 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_7_bit_osc_does_not_treat_a_utf8_continuation_as_st() {
+        assert_eq!(
+            parse_event(b"\x1B]10;unsupported-\xC3\x9C-payload\x1B\\", false).unwrap(),
+            Some(InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Unrecognized("unsupported-Ü-payload".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_osc_rejects_an_oversized_payload() {
+        let mut input = b"\x1B]10;".to_vec();
+        input.resize(MAX_OSC_SEQUENCE_LEN + 1, b'1');
+
+        assert!(parse_event(&input, false).is_err());
+    }
+
+    #[test]
+    fn test_parse_8_bit_c1_startup_replies_without_leaking_payload_as_keys() {
+        let input = b"h\x9B?20;10;1R\x9B?64;1;2c\x9B?7u\x9D10;rgb:ffff/8000/0000\x07\x9D11;rgb:0000/0000/ffff\x9Ci";
+        let mut buffer = Vec::new();
+        let mut events = Vec::new();
+
+        for (idx, byte) in input.iter().enumerate() {
+            buffer.push(*byte);
+            match parse_event(&buffer, idx + 1 < input.len()) {
+                Ok(Some(event)) => {
+                    events.push(event);
+                    buffer.clear();
+                }
+                Ok(None) => {}
+                Err(err) => panic!("failed to parse C1 startup reply at byte {idx}: {err}"),
+            }
+        }
+
+        assert_eq!(events.len(), 7);
+        assert_eq!(
+            events[0],
+            InternalEvent::Event(Event::Key(KeyCode::Char('h').into()))
+        );
+        assert_eq!(events[1], InternalEvent::ExtendedCursorPosition(9, 19));
+        assert_eq!(events[2], InternalEvent::PrimaryDeviceAttributes);
+        assert!(matches!(
+            events[3],
+            InternalEvent::KeyboardEnhancementFlags(_)
+        ));
+        assert_eq!(
+            events[4],
+            InternalEvent::OscColor {
+                slot: 10,
+                payload: OscColorPayload::Rgb {
+                    r: 255,
+                    g: 127,
+                    b: 0,
+                },
+            }
+        );
+        assert_eq!(
+            events[5],
+            InternalEvent::OscColor {
+                slot: 11,
+                payload: OscColorPayload::Rgb { r: 0, g: 0, b: 255 },
+            }
+        );
+        assert_eq!(
+            events[6],
+            InternalEvent::Event(Event::Key(KeyCode::Char('i').into()))
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[cfg(feature = "bracketed-paste")]
+    #[test]
+    fn test_parse_8_bit_c1_replies_around_utf8_and_bracketed_paste() {
+        let input = b"\xF0\x9F\x9A\x80\x9B?20;10R\x1B[200~hello \xF0\x9F\x8C\x8D\x1B[201~\x9D10;rgb:1111/2222/3333\x9C";
+        let mut buffer = Vec::new();
+        let mut events = Vec::new();
+
+        for (idx, byte) in input.iter().enumerate() {
+            buffer.push(*byte);
+            match parse_event(&buffer, idx + 1 < input.len()) {
+                Ok(Some(event)) => {
+                    events.push(event);
+                    buffer.clear();
+                }
+                Ok(None) => {}
+                Err(err) => panic!("failed to parse UTF-8 or paste at byte {idx}: {err}"),
+            }
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                InternalEvent::Event(Event::Key(KeyCode::Char('🚀').into())),
+                InternalEvent::ExtendedCursorPosition(9, 19),
+                InternalEvent::Event(Event::Paste("hello 🌍".to_string())),
+                InternalEvent::OscColor {
+                    slot: 10,
+                    payload: OscColorPayload::Rgb {
+                        r: 17,
+                        g: 34,
+                        b: 51,
+                    },
+                },
+            ]
+        );
+        assert!(buffer.is_empty());
     }
 
     #[test]

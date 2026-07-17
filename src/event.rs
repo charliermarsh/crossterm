@@ -151,7 +151,7 @@ pub(crate) fn lock_internal_event_reader() -> MappedMutexGuard<'static, Internal
         reader.get_or_insert_with(InternalEventReader::default)
     })
 }
-fn try_lock_internal_event_reader_for(
+pub(crate) fn try_lock_internal_event_reader_for(
     duration: Duration,
 ) -> Option<MappedMutexGuard<'static, InternalEventReader>> {
     Some(MutexGuard::map(
@@ -248,8 +248,64 @@ pub fn read() -> std::io::Result<Event> {
     match read_internal(&EventFilter)? {
         InternalEvent::Event(event) => Ok(event),
         #[cfg(unix)]
+        InternalEvent::CursorPositionOrF3(_, _, modifiers) => {
+            Ok(Event::Key(KeyEvent::new(KeyCode::F(3), modifiers)))
+        }
+        #[cfg(unix)]
         _ => unreachable!(),
     }
+}
+
+/// Discards pending terminal input, events, and partially parsed input buffered by crossterm's
+/// event reader.
+///
+/// The terminal input queue is flushed while the reader is locked, avoiding a race between the
+/// operating-system and parser queues. Returns `TimedOut` when the event reader cannot be locked
+/// within `timeout`.
+pub fn discard_pending_input(timeout: Duration) -> std::io::Result<()> {
+    let mut reader = try_lock_internal_event_reader_for(timeout).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out while locking the terminal event reader",
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use crate::terminal::sys::file_descriptor::tty_input_fd;
+
+        let tty = tty_input_fd()?;
+        #[cfg(feature = "libc")]
+        {
+            // Safety: `tcflush` only discards unread input for the supplied terminal descriptor.
+            if unsafe { libc::tcflush(tty.raw_fd(), libc::TCIFLUSH) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(feature = "libc"))]
+        rustix::termios::tcflush(&tty, rustix::termios::QueueSelector::IFlush)?;
+    }
+
+    #[cfg(windows)]
+    {
+        use winapi::um::{
+            handleapi::INVALID_HANDLE_VALUE, processenv::GetStdHandle, winbase::STD_INPUT_HANDLE,
+            wincon::FlushConsoleInputBuffer,
+        };
+
+        // Safety: `GetStdHandle` and `FlushConsoleInputBuffer` only access the console input
+        // handle and discard unread input records.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { FlushConsoleInputBuffer(handle) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    reader.clear();
+    Ok(())
 }
 
 /// Polls to check if there are any `InternalEvent`s that can be read within the given duration.
@@ -1177,6 +1233,12 @@ pub(crate) enum InternalEvent {
     /// A cursor position (`col`, `row`).
     #[cfg(unix)]
     CursorPosition(u16, u16),
+    /// An extended cursor position (`col`, `row`) returned for `CSI ? 6 n`.
+    #[cfg(unix)]
+    ExtendedCursorPosition(u16, u16),
+    /// A normal cursor response which is also an xterm modified-F3 sequence.
+    #[cfg(unix)]
+    CursorPositionOrF3(u16, u16, KeyModifiers),
     /// The progressive keyboard enhancement flags enabled by the terminal.
     #[cfg(unix)]
     KeyboardEnhancementFlags(KeyboardEnhancementFlags),
@@ -1207,6 +1269,16 @@ mod tests {
     use KeyCode::*;
     use MediaKeyCode::*;
     use ModifierKeyCode::*;
+
+    #[test]
+    fn discard_pending_input_reports_a_lock_timeout() {
+        let _reader = INTERNAL_EVENT_READER.lock();
+
+        assert_eq!(
+            discard_pending_input(Duration::ZERO).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
 
     #[test]
     fn test_equality() {

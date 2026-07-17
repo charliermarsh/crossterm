@@ -7,9 +7,7 @@ use std::{fs::File, io::Write, time::Duration};
 
 #[cfg(all(unix, feature = "events"))]
 use crate::{
-    event::{
-        filter::OscColorFilter, poll_internal, read_internal, InternalEvent, OscColorPayload,
-    },
+    event::{filter::OscColorFilter, poll_internal, read_internal, InternalEvent, OscColorPayload},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 

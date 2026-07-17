@@ -1,5 +1,7 @@
 //! This module provides platform related functions.
 
+#[cfg(all(unix, feature = "events"))]
+pub(crate) use self::unix::enable_raw_mode_if_needed;
 #[cfg(unix)]
 #[cfg(feature = "events")]
 pub use self::unix::supports_keyboard_enhancement;

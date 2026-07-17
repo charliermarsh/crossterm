@@ -93,6 +93,11 @@ impl EventSource for WindowsEventSource {
         }
     }
 
+    fn clear(&mut self) {
+        self.surrogate_buffer = None;
+        self.mouse_buttons_pressed = MouseButtonsPressed::default();
+    }
+
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker {
         self.poll.waker()
