@@ -9,6 +9,31 @@ use crate::event::{
 use crate::style::Color;
 use crate::terminal::{disable_raw_mode, enable_raw_mode};
 
+struct RawModeGuard {
+    active: bool,
+}
+
+impl RawModeGuard {
+    fn enable() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self { active: true })
+    }
+
+    fn restore(mut self) -> io::Result<()> {
+        disable_raw_mode()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
 /// Controls whether the terminal startup probe queries keyboard enhancement support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardEnhancementProbe {
@@ -100,6 +125,9 @@ fn color_from_payload(payload: OscColorPayload) -> Option<Color> {
 ///
 /// The query uses crossterm's internal event reader, so key presses, bracketed pastes, and other
 /// non-query events remain queued for the next [`crate::event::read`] or event stream poll.
+/// When keyboard support is queried, both the enhancement-flags and fallback responses are
+/// drained when available; an out-of-order fallback therefore uses the full timeout before it is
+/// treated as unsupported.
 pub fn query_terminal_startup(
     timeout: Duration,
     keyboard_probe: KeyboardEnhancementProbe,
@@ -107,9 +135,9 @@ pub fn query_terminal_startup(
     if crate::terminal::sys::is_raw_mode_enabled() {
         query_terminal_startup_raw(timeout, keyboard_probe)
     } else {
-        enable_raw_mode()?;
+        let raw_mode_guard = RawModeGuard::enable()?;
         let result = query_terminal_startup_raw(timeout, keyboard_probe);
-        disable_raw_mode()?;
+        raw_mode_guard.restore()?;
         result
     }
 }
@@ -124,13 +152,13 @@ fn query_terminal_startup_raw(
     };
     send_query(query)?;
 
-    let deadline = Instant::now() + timeout;
+    let started_at = Instant::now();
     let filter = TerminalStartupProbeFilter {
         query_keyboard: keyboard_probe == KeyboardEnhancementProbe::Query,
     };
     let mut state = ProbeState::default();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = remaining_timeout(started_at, timeout);
         if remaining.is_zero() || !poll_internal(Some(remaining), &filter)? {
             return Ok(state.into_probe());
         }
@@ -141,26 +169,39 @@ fn query_terminal_startup_raw(
     }
 }
 
-fn send_query(query: &[u8]) -> io::Result<()> {
-    let sent = OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")
-        .and_then(|mut tty| {
-            tty.write_all(query)?;
-            tty.flush()
-        });
+fn remaining_timeout(started_at: Instant, timeout: Duration) -> Duration {
+    timeout.saturating_sub(started_at.elapsed())
+}
 
-    if sent.is_err() {
+fn send_query(query: &[u8]) -> io::Result<()> {
+    #[cfg(feature = "libc")]
+    // Safety: `isatty` only inspects the supplied file descriptor.
+    let stdin_is_terminal = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    #[cfg(not(feature = "libc"))]
+    let stdin_is_terminal = rustix::termios::isatty(rustix::stdio::stdin());
+
+    if stdin_is_terminal {
         let mut stdout = io::stdout();
-        stdout.write_all(query)?;
-        stdout.flush()?;
+        write_query(query, &mut stdout)
+    } else {
+        let mut tty = OpenOptions::new().write(true).open("/dev/tty")?;
+        write_query(query, &mut tty)
     }
-    Ok(())
+}
+
+fn write_query(query: &[u8], writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(query)?;
+    writer.flush()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyboardEnhancementProbe, ProbeState, TerminalStartupProbe};
+    use std::io::{self, Write};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        remaining_timeout, write_query, KeyboardEnhancementProbe, ProbeState, TerminalStartupProbe,
+    };
     use crate::event::{InternalEvent, KeyboardEnhancementFlags, OscColorPayload};
     use crate::style::Color;
 
@@ -260,5 +301,49 @@ mod tests {
             state.into_probe().keyboard_enhancement_supported,
             Some(false)
         );
+    }
+
+    #[test]
+    fn remaining_timeout_handles_the_largest_duration() {
+        assert!(!remaining_timeout(Instant::now(), Duration::MAX).is_zero());
+    }
+
+    #[test]
+    fn remaining_timeout_saturates_after_the_deadline() {
+        let started_at = Instant::now() - Duration::from_millis(10);
+
+        assert_eq!(
+            remaining_timeout(started_at, Duration::from_millis(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn writes_and_flushes_the_complete_startup_query() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            bytes: Vec<u8>,
+            flushed: bool,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed = true;
+                Ok(())
+            }
+        }
+
+        let mut writer = RecordingWriter::default();
+        let query = b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\";
+
+        write_query(query, &mut writer).unwrap();
+
+        assert_eq!(writer.bytes, query);
+        assert!(writer.flushed);
     }
 }

@@ -73,6 +73,7 @@ impl InternalEventReader {
                     }
                 }
                 Err(e) => {
+                    self.events.extend(self.skipped_events.drain(..));
                     if e.kind() == io::ErrorKind::Interrupted {
                         return Ok(false);
                     }
@@ -103,9 +104,8 @@ impl InternalEventReader {
         loop {
             while let Some(event) = self.events.pop_front() {
                 if filter.eval(&event) {
-                    while let Some(event) = skipped_events.pop_front() {
-                        self.events.push_back(event);
-                    }
+                    skipped_events.append(&mut self.events);
+                    self.events = skipped_events;
 
                     return Ok(event);
                 } else {
@@ -120,7 +120,11 @@ impl InternalEventReader {
                 }
             }
 
-            let _ = self.poll(None, filter)?;
+            if let Err(err) = self.poll(None, filter) {
+                skipped_events.append(&mut self.events);
+                self.events = skipped_events;
+                return Err(err);
+            }
         }
     }
 }
@@ -135,7 +139,9 @@ mod tests {
     #[cfg(all(unix, feature = "bracketed-paste"))]
     use super::super::filter::TerminalStartupProbeFilter;
     #[cfg(all(unix, feature = "bracketed-paste"))]
-    use super::super::{KeyCode, KeyEvent, OscColorPayload};
+    use super::super::OscColorPayload;
+    #[cfg(unix)]
+    use super::super::{KeyCode, KeyEvent};
     use super::{
         super::{filter::EventFilter as InternalEventFilter, Event},
         EventSource, InternalEvent, InternalEventReader,
@@ -226,6 +232,68 @@ mod tests {
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), SKIPPED_EVENT);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_read_preserves_input_order_around_queued_response() {
+        let first = InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('a'))));
+        let second = InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('b'))));
+        let cursor = InternalEvent::CursorPosition(10, 20);
+
+        let mut reader = InternalEventReader {
+            events: vec![first.clone(), cursor.clone(), second.clone()].into(),
+            source: None,
+            skipped_events: Vec::with_capacity(32),
+        };
+
+        assert_eq!(reader.read(&CursorPositionFilter).unwrap(), cursor);
+        assert_eq!(reader.read(&InternalEventFilter).unwrap(), first);
+        assert_eq!(reader.read(&InternalEventFilter).unwrap(), second);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_poll_preserves_skipped_input_after_interrupted_or_failed_source_read() {
+        for error_kind in [io::ErrorKind::Interrupted, io::ErrorKind::Other] {
+            let key = InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('a'))));
+            let cursor = InternalEvent::CursorPosition(10, 20);
+            let source = FakeSource {
+                events: vec![key.clone(), cursor.clone()].into(),
+                error: Some(io::Error::new(error_kind, "")),
+            };
+            let mut reader = InternalEventReader {
+                events: VecDeque::new(),
+                source: Some(Box::new(source)),
+                skipped_events: Vec::with_capacity(32),
+            };
+
+            let result = reader.poll(Some(Duration::from_secs(1)), &CursorPositionFilter);
+            if error_kind == io::ErrorKind::Interrupted {
+                assert!(!result.unwrap());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), error_kind);
+            }
+            assert_eq!(reader.read(&InternalEventFilter).unwrap(), key);
+            assert_eq!(reader.read(&CursorPositionFilter).unwrap(), cursor);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_read_preserves_prequeued_input_after_failed_source_read() {
+        let key = InternalEvent::Event(Event::Key(KeyEvent::from(KeyCode::Char('a'))));
+        let mut reader = InternalEventReader {
+            events: vec![key.clone()].into(),
+            source: Some(Box::new(FakeSource::new(&[]))),
+            skipped_events: Vec::with_capacity(32),
+        };
+
+        assert_eq!(
+            reader.read(&CursorPositionFilter).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(reader.read(&InternalEventFilter).unwrap(), key);
     }
 
     #[test]

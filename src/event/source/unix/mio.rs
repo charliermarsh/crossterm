@@ -92,31 +92,34 @@ impl EventSource for UnixInternalEventSource {
             for token in self.events.iter().map(|x| x.token()) {
                 match token {
                     TTY_TOKEN => {
-                        loop {
-                            match self.tty_fd.read(&mut self.tty_buffer) {
-                                Ok(read_count) => {
-                                    if read_count > 0 {
-                                        self.parser.advance(
-                                            &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    // No more data to read at the moment. We will receive another event
-                                    if e.kind() == io::ErrorKind::WouldBlock {
-                                        break;
-                                    }
-                                    // once more data is available to read.
-                                    else if e.kind() == io::ErrorKind::Interrupted {
-                                        continue;
-                                    }
-                                }
-                            };
+                        // Terminal descriptors are normally blocking. Read at most once for
+                        // each readiness notification so an incomplete sequence cannot block a
+                        // bounded poll while it waits for its next byte.
+                        match self.tty_fd.read(&mut self.tty_buffer) {
+                            Ok(read_count) => {
+                                if read_count > 0 {
+                                    self.parser.advance(
+                                        &self.tty_buffer[..read_count],
+                                        read_count == TTY_BUFFER_SIZE,
+                                    );
 
-                            if let Some(event) = self.parser.next() {
-                                return Ok(Some(event));
+                                    // Mio readiness is edge-triggered. Re-arm it before polling
+                                    // again in case this read left more input in the tty buffer.
+                                    let tty_raw_fd = self.tty_fd.raw_fd();
+                                    self.poll.registry().reregister(
+                                        &mut SourceFd(&tty_raw_fd),
+                                        TTY_TOKEN,
+                                        Interest::READABLE,
+                                    )?;
+                                }
                             }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            Err(e) => return Err(e),
+                        };
+
+                        if let Some(event) = self.parser.next() {
+                            return Ok(Some(event));
                         }
                     }
                     SIGNAL_TOKEN => {
@@ -227,3 +230,7 @@ impl Iterator for Parser {
         self.internal_events.pop_front()
     }
 }
+
+#[cfg(test)]
+#[path = "bounded_read_tests.rs"]
+mod tests;

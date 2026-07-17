@@ -36,11 +36,11 @@ fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
 
     let slot = match parts.next().unwrap_or("").parse::<u16>() {
         Ok(value) if value <= u8::MAX as u16 => value as u8,
-        _ => return Ok(None),
+        _ => return Err(could_not_parse_event_error()),
     };
 
     if slot != 10 && slot != 11 {
-        return Ok(None);
+        return Err(could_not_parse_event_error());
     }
 
     let payload_str = parts.next().unwrap_or("");
@@ -301,8 +301,8 @@ pub(crate) fn parse_csi_cursor_position(buffer: &[u8]) -> io::Result<Option<Inte
 
     let mut split = s.split(';');
 
-    let y = next_parsed::<u16>(&mut split)? - 1;
-    let x = next_parsed::<u16>(&mut split)? - 1;
+    let y = next_parsed::<u16>(&mut split)?.saturating_sub(1);
+    let x = next_parsed::<u16>(&mut split)?.saturating_sub(1);
 
     Ok(Some(InternalEvent::CursorPosition(x, y)))
 }
@@ -1062,6 +1062,10 @@ mod tests {
             parse_csi_cursor_position(b"\x1B[20;10R").unwrap(),
             Some(InternalEvent::CursorPosition(9, 19))
         );
+        assert_eq!(
+            parse_csi_cursor_position(b"\x1B[0;0R").unwrap(),
+            Some(InternalEvent::CursorPosition(0, 0))
+        );
     }
 
     #[test]
@@ -1097,6 +1101,17 @@ mod tests {
             parse_csi_special_key_code(b"\x1B[3;2~").unwrap(),
             Some(InternalEvent::Event(Event::Key(KeyEvent::new(
                 KeyCode::Delete,
+                KeyModifiers::SHIFT
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_parse_shift_f3_uses_the_unambiguous_function_key_encoding() {
+        assert_eq!(
+            parse_event(b"\x1B[13;2~", false).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::F(3),
                 KeyModifiers::SHIFT
             )))),
         );
@@ -1592,6 +1607,38 @@ mod tests {
                 assert_eq!(payload, OscColorPayload::Unrecognized("?".to_string()));
             }
             other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_completed_unknown_or_malformed_osc_does_not_poison_later_input() {
+        for input in [
+            b"\x1B]12;rgb:ffff/0000/0000\x07h\x1B[20;10R".as_slice(),
+            b"\x1B]not-a-slot;payload\x1B\\h\x1B[20;10R".as_slice(),
+        ] {
+            let mut buffer = Vec::new();
+            let mut events = Vec::new();
+
+            for (idx, byte) in input.iter().enumerate() {
+                buffer.push(*byte);
+                match parse_event(&buffer, idx + 1 < input.len()) {
+                    Ok(Some(event)) => {
+                        events.push(event);
+                        buffer.clear();
+                    }
+                    Ok(None) => {}
+                    Err(_) => buffer.clear(),
+                }
+            }
+
+            assert_eq!(
+                events,
+                vec![
+                    InternalEvent::Event(Event::Key(KeyCode::Char('h').into())),
+                    InternalEvent::CursorPosition(9, 19),
+                ]
+            );
+            assert!(buffer.is_empty());
         }
     }
 }

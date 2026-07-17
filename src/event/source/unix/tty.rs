@@ -145,22 +145,18 @@ impl EventSource for UnixInternalEventSource {
                 Ok(_) => (),
             };
             if fds[0].revents & POLLIN != 0 {
-                loop {
-                    let read_count = read_complete(&self.tty, &mut self.tty_buffer)?;
-                    if read_count > 0 {
-                        self.parser.advance(
-                            &self.tty_buffer[..read_count],
-                            read_count == TTY_BUFFER_SIZE,
-                        );
-                    }
+                // Terminal descriptors are normally blocking. Read at most once for each
+                // readiness notification so an incomplete sequence cannot block a bounded poll.
+                let read_count = read_complete(&self.tty, &mut self.tty_buffer)?;
+                if read_count > 0 {
+                    self.parser.advance(
+                        &self.tty_buffer[..read_count],
+                        read_count == TTY_BUFFER_SIZE,
+                    );
+                }
 
-                    if let Some(event) = self.parser.next() {
-                        return Ok(Some(event));
-                    }
-
-                    if read_count == 0 {
-                        break;
-                    }
+                if let Some(event) = self.parser.next() {
+                    return Ok(Some(event));
                 }
             }
             if fds[1].revents & POLLIN != 0 {
@@ -273,3 +269,7 @@ impl Iterator for Parser {
         self.internal_events.pop_front()
     }
 }
+
+#[cfg(test)]
+#[path = "bounded_read_tests.rs"]
+mod tests;
