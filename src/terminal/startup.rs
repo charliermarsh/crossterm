@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,8 @@ struct ProbeState {
     cursor_position: Option<(u16, u16)>,
     foreground_color: Option<Option<Color>>,
     background_color: Option<Option<Color>>,
-    keyboard_enhancement_supported: Option<bool>,
+    saw_keyboard_enhancement_flags: bool,
+    saw_primary_device_attributes: bool,
 }
 
 impl ProbeState {
@@ -58,12 +59,10 @@ impl ProbeState {
                 }
             }
             InternalEvent::KeyboardEnhancementFlags(_) => {
-                self.keyboard_enhancement_supported = Some(true);
+                self.saw_keyboard_enhancement_flags = true;
             }
             InternalEvent::PrimaryDeviceAttributes => {
-                if self.keyboard_enhancement_supported.is_none() {
-                    self.keyboard_enhancement_supported = Some(false);
-                }
+                self.saw_primary_device_attributes = true;
             }
             InternalEvent::Event(_) | InternalEvent::OscColor { .. } => {}
         }
@@ -74,7 +73,7 @@ impl ProbeState {
             && self.foreground_color.is_some()
             && self.background_color.is_some()
             && (keyboard_probe == KeyboardEnhancementProbe::Skip
-                || self.keyboard_enhancement_supported.is_some())
+                || self.saw_keyboard_enhancement_flags && self.saw_primary_device_attributes)
     }
 
     fn into_probe(self) -> TerminalStartupProbe {
@@ -82,7 +81,10 @@ impl ProbeState {
             cursor_position: self.cursor_position,
             foreground_color: self.foreground_color.flatten(),
             background_color: self.background_color.flatten(),
-            keyboard_enhancement_supported: self.keyboard_enhancement_supported,
+            keyboard_enhancement_supported: self
+                .saw_keyboard_enhancement_flags
+                .then_some(true)
+                .or_else(|| self.saw_primary_device_attributes.then_some(false)),
         }
     }
 }
@@ -140,10 +142,13 @@ fn query_terminal_startup_raw(
 }
 
 fn send_query(query: &[u8]) -> io::Result<()> {
-    let sent = File::open("/dev/tty").and_then(|mut tty| {
-        tty.write_all(query)?;
-        tty.flush()
-    });
+    let sent = OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .and_then(|mut tty| {
+            tty.write_all(query)?;
+            tty.flush()
+        });
 
     if sent.is_err() {
         let mut stdout = io::stdout();
@@ -210,6 +215,50 @@ mod tests {
                 background_color: None,
                 keyboard_enhancement_supported: None,
             }
+        );
+    }
+
+    #[test]
+    fn waits_for_the_keyboard_fallback_after_supported_flags() {
+        let mut state = ProbeState::default();
+        state.record(InternalEvent::CursorPosition(0, 0));
+        state.record(InternalEvent::OscColor {
+            slot: 10,
+            payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
+        });
+        state.record(InternalEvent::OscColor {
+            slot: 11,
+            payload: OscColorPayload::Rgb { r: 4, g: 5, b: 6 },
+        });
+        state.record(InternalEvent::KeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ));
+
+        assert!(!state.is_complete(KeyboardEnhancementProbe::Query));
+        assert_eq!(
+            state.into_probe().keyboard_enhancement_supported,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn waits_for_supported_flags_when_the_fallback_arrives_first() {
+        let mut state = ProbeState::default();
+        state.record(InternalEvent::CursorPosition(0, 0));
+        state.record(InternalEvent::OscColor {
+            slot: 10,
+            payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
+        });
+        state.record(InternalEvent::OscColor {
+            slot: 11,
+            payload: OscColorPayload::Rgb { r: 4, g: 5, b: 6 },
+        });
+        state.record(InternalEvent::PrimaryDeviceAttributes);
+
+        assert!(!state.is_complete(KeyboardEnhancementProbe::Query));
+        assert_eq!(
+            state.into_probe().keyboard_enhancement_supported,
+            Some(false)
         );
     }
 }

@@ -73,7 +73,7 @@ impl Filter for TerminalStartupProbeFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
         matches!(
             *event,
-            InternalEvent::CursorPosition(_, _) | InternalEvent::OscColor { .. }
+            InternalEvent::CursorPosition(_, _) | InternalEvent::OscColor { slot: 10 | 11, .. }
         ) || self.query_keyboard
             && matches!(
                 *event,
@@ -164,6 +164,10 @@ mod tests {
         )));
         assert!(filter.eval(&InternalEvent::PrimaryDeviceAttributes));
         assert!(!filter.eval(&InternalEvent::Event(Event::Resize(10, 10))));
+        assert!(!filter.eval(&OscColor {
+            slot: 12,
+            payload: OscColorPayload::Rgb { r: 1, g: 2, b: 3 },
+        }));
 
         let filter = TerminalStartupProbeFilter {
             query_keyboard: false,
