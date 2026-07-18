@@ -120,3 +120,7 @@ required-features = ["events"]
 [[example]]
 name = "copy-to-clipboard"
 required-features = ["osc52"]
+
+[[example]]
+name = "query-colors"
+required-features = ["events"]

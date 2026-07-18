@@ -5,7 +5,8 @@ use crate::event::{
     MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use super::super::super::InternalEvent;
+use crate::event::{InternalEvent, OscColorPayload};
+use crate::style::Color;
 
 // Event parsing
 //
@@ -21,6 +22,55 @@ use super::super::super::InternalEvent;
 
 fn could_not_parse_event_error() -> io::Error {
     io::Error::new(io::ErrorKind::Other, "Could not parse an event.")
+}
+
+fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    debug_assert!(buffer.starts_with(b"\x1B]"));
+
+    let Some(content_end) = osc_payload_end(buffer) else {
+        return Ok(None);
+    };
+
+    let text = String::from_utf8_lossy(&buffer[2..content_end]);
+    let mut parts = text.splitn(2, ';');
+
+    let slot = match parts.next().unwrap_or("").parse::<u16>() {
+        Ok(value) if value <= u8::MAX as u16 => value as u8,
+        _ => return Ok(None),
+    };
+
+    if slot != 10 && slot != 11 {
+        return Ok(None);
+    }
+
+    let payload_str = parts.next().unwrap_or("");
+    let payload = match Color::from_osc_rgb(payload_str) {
+        Some(Color::Rgb { r, g, b }) => OscColorPayload::Rgb { r, g, b },
+        Some(_) => unreachable!("Color::from_osc_rgb returned non-RGB variant"),
+        None => OscColorPayload::Unrecognized(payload_str.to_string()),
+    };
+
+    Ok(Some(InternalEvent::OscColor { slot, payload }))
+}
+
+fn osc_payload_end(buffer: &[u8]) -> Option<usize> {
+    let mut idx = 2;
+    while idx < buffer.len() {
+        match buffer[idx] {
+            0x07 => return Some(idx),
+            0x1B => {
+                if idx + 1 >= buffer.len() {
+                    return None;
+                }
+                if buffer[idx + 1] == b'\\' {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
 }
 
 pub(crate) fn parse_event(
@@ -74,6 +124,7 @@ pub(crate) fn parse_event(
                         }
                     }
                     b'[' => parse_csi(buffer),
+                    b']' => parse_osc(buffer),
                     b'\x1B' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))),
                     _ => parse_event(&buffer[1..], input_available).map(|event_option| {
                         event_option.map(|event| {
@@ -863,7 +914,7 @@ pub(crate) fn parse_utf8_char(buffer: &[u8]) -> io::Result<Option<char>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::event::{KeyEventState, KeyModifiers, MouseButton, MouseEvent};
+    use crate::event::{KeyEventState, KeyModifiers, MouseButton, MouseEvent, OscColorPayload};
 
     use super::*;
 
@@ -1502,5 +1553,45 @@ mod tests {
                 KeyEventKind::Release,
             )))),
         );
+    }
+
+    #[test]
+    fn test_parse_osc_color_with_bel_terminator() {
+        match parse_event(b"\x1B]10;rgb:ffff/8000/0000\x07", false).unwrap() {
+            Some(InternalEvent::OscColor { slot, payload }) => {
+                assert_eq!(slot, 10);
+                assert_eq!(
+                    payload,
+                    OscColorPayload::Rgb {
+                        r: 255,
+                        g: 127,
+                        b: 0
+                    }
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_osc_color_with_st_terminator() {
+        match parse_event(b"\x1B]11;rgb:0000/0000/ffff\x1B\\", false).unwrap() {
+            Some(InternalEvent::OscColor { slot, payload }) => {
+                assert_eq!(slot, 11);
+                assert_eq!(payload, OscColorPayload::Rgb { r: 0, g: 0, b: 255 });
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_osc_color_unrecognized_payload() {
+        match parse_event(b"\x1B]10;?\x07", false).unwrap() {
+            Some(InternalEvent::OscColor { slot, payload }) => {
+                assert_eq!(slot, 10);
+                assert_eq!(payload, OscColorPayload::Unrecognized("?".to_string()));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

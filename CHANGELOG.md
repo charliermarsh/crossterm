@@ -1,5 +1,10 @@
 # Unreleased
 
+## Added ⭐
+
+- Query terminal default colors via OSC 10/11 on Unix using `query_foreground_color` and
+  `query_background_color`.
+
 # Version 0.29
 
 ## Added ⭐
@@ -14,7 +19,6 @@
 ## Breaking ⚠️
 
 - Correctly fix KeyModifiers Display impl Properly adding + in between modifiers (#979)
-
 
 # Version 0.28.1
 
