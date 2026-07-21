@@ -232,6 +232,7 @@ fn query_standard_cursor_position(
     started_at: Instant,
     timeout: Duration,
 ) -> io::Result<Option<(u16, u16)>> {
+    reader.queue_ready_events()?;
     let queued_events = reader.take_queued_events();
     let result = (|| {
         send_query(b"\x1B[6n", started_at, timeout)?;

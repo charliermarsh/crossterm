@@ -45,6 +45,16 @@ impl InternalEventReader {
         std::mem::take(&mut self.events)
     }
 
+    pub(crate) fn queue_ready_events(&mut self) -> io::Result<()> {
+        let source = self.source.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "Failed to initialize input reader")
+        })?;
+        while let Some(event) = source.try_read(Some(Duration::ZERO))? {
+            self.events.push_back(event);
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepend_queued_events(&mut self, mut events: VecDeque<InternalEvent>) {
         events.append(&mut self.events);
         self.events = events;
@@ -551,14 +561,16 @@ mod tests {
         let queued_f3 = InternalEvent::CursorPositionOrF3(8, 0, KeyModifiers::SUPER);
         let expected_response = InternalEvent::CursorPositionOrF3(1, 0, KeyModifiers::SHIFT);
         let mut reader = InternalEventReader {
-            events: vec![queued_f3.clone()].into(),
-            source: Some(Box::new(FakeSource::with_events(&[
-                expected_response.clone()
-            ]))),
+            events: VecDeque::new(),
+            source: Some(Box::new(FakeSource::with_events(&[queued_f3.clone()]))),
             skipped_events: Vec::with_capacity(32),
         };
 
+        reader.queue_ready_events().unwrap();
         let queued_events = reader.take_queued_events();
+        reader.source = Some(Box::new(FakeSource::with_events(&[
+            expected_response.clone()
+        ])));
         assert!(reader
             .poll(Some(Duration::from_secs(1)), &CursorPositionFilter)
             .unwrap());
