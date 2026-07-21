@@ -41,6 +41,15 @@ impl InternalEventReader {
         }
     }
 
+    pub(crate) fn take_queued_events(&mut self) -> VecDeque<InternalEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    pub(crate) fn prepend_queued_events(&mut self, mut events: VecDeque<InternalEvent>) {
+        events.append(&mut self.events);
+        self.events = events;
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
@@ -534,6 +543,35 @@ mod tests {
             reader.read(&InternalEventFilter).unwrap(),
             InternalEvent::CursorPositionOrF3(1, 0, KeyModifiers::SHIFT)
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_standard_cursor_fallback_consumes_one_ambiguous_response_and_preserves_queued_f3() {
+        let queued_f3 = InternalEvent::CursorPositionOrF3(8, 0, KeyModifiers::SUPER);
+        let expected_response = InternalEvent::CursorPositionOrF3(1, 0, KeyModifiers::SHIFT);
+        let mut reader = InternalEventReader {
+            events: vec![queued_f3.clone()].into(),
+            source: Some(Box::new(FakeSource::with_events(&[
+                expected_response.clone()
+            ]))),
+            skipped_events: Vec::with_capacity(32),
+        };
+
+        let queued_events = reader.take_queued_events();
+        assert!(reader
+            .poll(Some(Duration::from_secs(1)), &CursorPositionFilter)
+            .unwrap());
+        assert_eq!(
+            reader.read(&CursorPositionFilter).unwrap(),
+            expected_response
+        );
+        reader.prepend_queued_events(queued_events);
+
+        assert_eq!(reader.read(&InternalEventFilter).unwrap(), queued_f3);
+        assert!(!reader
+            .poll(Some(Duration::ZERO), &InternalEventFilter)
+            .unwrap());
     }
 
     #[cfg(all(unix, feature = "bracketed-paste"))]

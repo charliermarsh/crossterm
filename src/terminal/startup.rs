@@ -4,7 +4,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
 use crate::event::{
-    filter::TerminalStartupProbeFilter, read::InternalEventReader,
+    filter::{CursorPositionFilter, TerminalStartupProbeFilter},
+    read::InternalEventReader,
     try_lock_internal_event_reader_for, InternalEvent, OscColorPayload,
 };
 use crate::style::Color;
@@ -106,6 +107,14 @@ impl ProbeState {
                 || self.saw_primary_device_attributes)
     }
 
+    fn only_cursor_is_missing(&self, keyboard_probe: KeyboardEnhancementProbe) -> bool {
+        self.cursor_position.is_none()
+            && self.foreground_color.is_some()
+            && self.background_color.is_some()
+            && (keyboard_probe == KeyboardEnhancementProbe::Skip
+                || self.saw_primary_device_attributes)
+    }
+
     fn into_probe(self) -> TerminalStartupProbe {
         TerminalStartupProbe {
             cursor_position: self.cursor_position,
@@ -138,6 +147,9 @@ fn color_from_payload(payload: OscColorPayload) -> Option<Color> {
 /// terminal descriptor so a contended stdout mutex cannot extend the deadline.
 /// When keyboard support is queried, primary device attributes complete the unsupported fallback
 /// immediately. If enhancement flags arrive first, the fallback is drained before returning.
+/// Terminals that do not implement the extended cursor-position request receive one standard CPR
+/// retry within the same deadline. Already-queued modified-F3 input is preserved before the retry;
+/// a first-row CPR response that collides with the legacy F3 encoding is consumed exactly once.
 pub fn query_terminal_startup(
     timeout: Duration,
     keyboard_probe: KeyboardEnhancementProbe,
@@ -176,16 +188,66 @@ fn query_terminal_startup_raw(
         query_keyboard: keyboard_probe == KeyboardEnhancementProbe::Query,
     };
     let mut state = ProbeState::default();
+    let mut standard_cursor_attempted = false;
+    let standard_cursor_after = timeout / 2;
     loop {
-        let remaining = remaining_timeout(started_at, timeout);
-        if remaining.is_zero() || !reader.poll(Some(remaining), &filter)? {
+        if state.is_complete(keyboard_probe) {
+            while reader.poll(Some(Duration::ZERO), &filter)? {
+                state.record(reader.read(&filter)?);
+            }
             return Ok(state.into_probe());
+        }
+
+        let remaining = remaining_timeout(started_at, timeout);
+        if remaining.is_zero() {
+            return Ok(state.into_probe());
+        }
+
+        if !standard_cursor_attempted
+            && state.cursor_position.is_none()
+            && (state.only_cursor_is_missing(keyboard_probe)
+                || started_at.elapsed() >= standard_cursor_after)
+        {
+            standard_cursor_attempted = true;
+            if let Some(position) = query_standard_cursor_position(reader, started_at, timeout)? {
+                state.cursor_position = Some(position);
+            }
+            continue;
+        }
+
+        let poll_timeout = if !standard_cursor_attempted && state.cursor_position.is_none() {
+            remaining.min(standard_cursor_after.saturating_sub(started_at.elapsed()))
+        } else {
+            remaining
+        };
+        if poll_timeout.is_zero() || !reader.poll(Some(poll_timeout), &filter)? {
+            continue;
         }
         state.record(reader.read(&filter)?);
-        if state.is_complete(keyboard_probe) {
-            return Ok(state.into_probe());
-        }
     }
+}
+
+fn query_standard_cursor_position(
+    reader: &mut InternalEventReader,
+    started_at: Instant,
+    timeout: Duration,
+) -> io::Result<Option<(u16, u16)>> {
+    let queued_events = reader.take_queued_events();
+    let result = (|| {
+        send_query(b"\x1B[6n", started_at, timeout)?;
+        let remaining = remaining_timeout(started_at, timeout);
+        if remaining.is_zero() || !reader.poll(Some(remaining), &CursorPositionFilter)? {
+            return Ok(None);
+        }
+        match reader.read(&CursorPositionFilter)? {
+            InternalEvent::CursorPosition(x, y) | InternalEvent::CursorPositionOrF3(x, y, _) => {
+                Ok(Some((x, y)))
+            }
+            _ => unreachable!("cursor-position filter returned a non-cursor event"),
+        }
+    })();
+    reader.prepend_queued_events(queued_events);
+    result
 }
 
 fn remaining_timeout(started_at: Instant, timeout: Duration) -> Duration {
